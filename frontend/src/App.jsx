@@ -1,86 +1,273 @@
-import { useRef, useState } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import './App.css'
 
-const environments = [
-  ['Pod Kill', 'pod-kill', 'Terminate a pod and observe recovery.'],
+const CHAOS_ENVIRONMENTS = [
+  ['Pod Kill', 'pod-kill', 'Terminate workload pod and observe recovery.'],
   ['CPU Stress', 'cpu-stress', 'Saturate processor capacity.'],
-  ['Memory Stress', 'memory-stress', 'Apply memory pressure.'],
-  ['Network Delay', 'network-delay', 'Add latency between workloads.'],
-  ['Network Loss', 'network-packet-loss', 'Drop packets and measure retries.'],
-  ['Network Partition', 'network-partition', 'Isolate a service.'],
-  ['Node Failure', 'node-failure', 'Simulate a node outage.'],
+  ['Memory Stress', 'memory-stress', 'Apply container memory pressure.'],
+  ['Network Delay', 'network-delay', 'Inject latency between microservices.'],
+  ['Network Loss', 'network-loss', 'Drop packets and measure error retries.'],
+  ['Network Partition', 'network-partition', 'Isolate service communications.'],
+  ['Node Failure', 'node-failure', 'Simulate underlying Kubernetes node outage.'],
 ]
 
-const defaultForm = {
-  github_url: '',
+const STAGE_KEYS = [
+  { key: 'deploy', label: 'Deploy' },
+  { key: 'pod_kill', label: 'Pod Kill' },
+  { key: 'five_chaos', label: '5-Chaos' },
+  { key: 'node_failure', label: 'Node Fail' },
+]
+
+const DEFAULT_FORM = {
+  github_url: 'https://github.com/GoogleCloudPlatform/microservices-demo.git',
   cpu: '2',
   memory: '4Gi',
   vus: '10',
   duration: '30s',
+  mode: 'binary_search',
 }
 
 function App() {
-  const [form, setForm] = useState(defaultForm)
-  const [selected, setSelected] = useState(environments.map(([name]) => name))
-  const [logs, setLogs] = useState([['info', 'Console ready. Configure an environment run to begin.']])
+  const [form, setForm] = useState(DEFAULT_FORM)
+  const [selectedEnvironments, setSelectedEnvironments] = useState(
+    CHAOS_ENVIRONMENTS.map(([name]) => name)
+  )
   const [running, setRunning] = useState(false)
-  const controllerRef = useRef(null)
+  const [configCollapsed, setConfigCollapsed] = useState(false)
 
-  const addLog = (type, message) => {
-    const lines = message.split(/\r?\n/).filter(Boolean)
-    setLogs((current) => [...current, ...lines.map((line) => [type, line])])
+  // Service-wise state: list of services: { name, namespace, kind, status, stages: {}, optimization, metrics, error }
+  const [services, setServices] = useState([])
+  const [selectedServiceName, setSelectedServiceName] = useState(null)
+  const [serviceFilter, setServiceFilter] = useState('all') // 'all' | 'running' | 'passed' | 'failed'
+
+  // Logs state: all logs, plus per-service partitioned logs
+  const [globalLogs, setGlobalLogs] = useState([
+    { type: 'info', text: 'Console ready. Configure workload and run resilience orchestrator.' },
+  ])
+  const [serviceLogs, setServiceLogs] = useState({}) // { [serviceName]: [{type, text}] }
+  const [activeLogTab, setActiveLogTab] = useState('service') // 'service' | 'all'
+  const [logFilterQuery, setLogFilterQuery] = useState('')
+
+  const [autoScroll, setAutoScroll] = useState(true)
+  const isUserInspectingRef = useRef(false)
+  const controllerRef = useRef(null)
+  const terminalBottomRef = useRef(null)
+
+
+  const addLogEntry = (serviceName, type, text) => {
+    const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0)
+    if (lines.length === 0) return
+
+    setGlobalLogs((prev) => [
+      ...prev,
+      ...lines.map((line) => ({ type, text: line, service: serviceName })),
+    ])
+
+    if (serviceName) {
+      setServiceLogs((prev) => ({
+        ...prev,
+        [serviceName]: [
+          ...(prev[serviceName] || []),
+          ...lines.map((line) => ({ type, text: line })),
+        ],
+      }))
+    }
   }
 
-  const update = (event) => {
-    const { name, value } = event.target
-    setForm((current) => ({ ...current, [name]: value }))
+  const updateField = (e) => {
+    const { name, value } = e.target
+    setForm((prev) => ({ ...prev, [name]: value }))
   }
 
   const toggleEnvironment = (name) => {
-    setSelected((current) => current.includes(name)
-      ? current.filter((item) => item !== name)
-      : [...current, name])
+    setSelectedEnvironments((prev) =>
+      prev.includes(name) ? prev.filter((item) => item !== name) : [...prev, name]
+    )
   }
 
-  const runExperiment = async (event) => {
-    event.preventDefault()
+  const runExperiment = async (e) => {
+    e.preventDefault()
     if (running) return
+
     setRunning(true)
+    setConfigCollapsed(true)
+    setServices([])
+    setSelectedServiceName(null)
+    setGlobalLogs([])
+    setServiceLogs({})
+    setActiveLogTab('service')
+    isUserInspectingRef.current = false
+
     controllerRef.current = new AbortController()
-    setLogs([])
-    addLog('command', '$ POST /api/environment-orchestrator/run')
+    addLogEntry(null, 'command', '$ POST /api/environment-orchestrator/run')
 
     try {
       const response = await fetch('/api/environment-orchestrator/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...form, environments: selected }),
+        body: JSON.stringify({
+          ...form,
+          environments: selectedEnvironments,
+        }),
         signal: controllerRef.current.signal,
       })
+
       if (!response.ok) throw new Error(`Backend returned HTTP ${response.status}`)
-      if (!response.body) throw new Error('Backend did not return a stream')
+      if (!response.body) throw new Error('Backend did not return an SSE stream')
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
         const messages = buffer.split('\n\n')
         buffer = messages.pop() || ''
-        messages.forEach((message) => {
-          const data = message.split('\n').find((line) => line.startsWith('data: '))
-          const event = message.split('\n').find((line) => line.startsWith('event: '))?.slice(7) || 'output'
-          if (!data) return
-          const payload = JSON.parse(data.slice(6))
-          if (event === 'output') addLog('info', payload.text)
-          if (event === 'result') addLog('success', 'Environment simulation completed.')
-          if (event === 'error') addLog('error', `Environment simulation failed: ${payload.message}`)
+
+        messages.forEach((msg) => {
+          if (!msg.trim()) return
+          const lines = msg.split('\n')
+          const eventLine = lines.find((l) => l.startsWith('event: '))
+          const dataLine = lines.find((l) => l.startsWith('data: '))
+          const event = eventLine ? eventLine.slice(7).trim() : 'output'
+          if (!dataLine) return
+
+          let payload
+          try {
+            payload = JSON.parse(dataLine.slice(6).trim())
+          } catch {
+            return
+          }
+
+          // Handle typed SSE events
+          if (event === 'discovery') {
+            const discovered = (payload.services || []).map((s) => ({
+              name: s.name,
+              namespace: s.namespace || 'default',
+              kind: s.kind || 'Deployment',
+              status: 'waiting',
+              stages: {
+                deploy: 'pending',
+                pod_kill: 'pending',
+                five_chaos: 'pending',
+                node_failure: 'pending',
+              },
+              optimization: null,
+              metrics: null,
+              error: null,
+            }))
+            setServices(discovered)
+            if (discovered.length > 0) {
+              setSelectedServiceName(discovered[0].name)
+            }
+            addLogEntry(
+              null,
+              'success',
+              `Discovered ${discovered.length} microservices in target repository.`
+            )
+          } else if (event === 'service_start') {
+            const svcName = payload.service
+            setServices((prev) =>
+              prev.map((s) => (s.name === svcName ? { ...s, status: 'running' } : s))
+            )
+            // Only auto-switch selected service if user is not actively inspecting another service
+            if (!isUserInspectingRef.current) {
+              setSelectedServiceName(svcName)
+            }
+            addLogEntry(
+              svcName,
+              'command',
+              `▶ Starting resilience simulation for ${svcName} (${payload.index}/${payload.total})`
+            )
+          } else if (event === 'stage_update') {
+            const { service: svcName, stage, status } = payload
+            setServices((prev) =>
+              prev.map((s) =>
+                s.name === svcName
+                  ? {
+                      ...s,
+                      stages: {
+                        ...s.stages,
+                        [stage]: status,
+                      },
+                    }
+                  : s
+              )
+            )
+          } else if (event === 'iteration_update') {
+            const svcName = payload.service
+            setServices((prev) =>
+              prev.map((s) => {
+                if (s.name !== svcName) return s
+                const existing = s.iterations || []
+                const filtered = existing.filter((it) => it.iteration !== payload.iteration)
+                const updated = [...filtered, payload].sort((a, b) => a.iteration - b.iteration)
+                return {
+                  ...s,
+                  iterations: updated,
+                }
+              })
+            )
+            addLogEntry(
+              svcName,
+              payload.sla_passed ? 'success' : 'error',
+              `[Iter ${payload.iteration}/${payload.max_iterations}] ${payload.parameter} @ ${payload.tested_value} ➔ ${
+                payload.sla_passed ? 'PASSED' : 'BREACHED'
+              } | ${payload.step_taken}`
+            )
+          } else if (event === 'service_log') {
+            addLogEntry(payload.service, 'info', payload.text)
+          } else if (event === 'service_result') {
+            const svcName = payload.service
+            const isPassed = payload.status === 'passed'
+            setServices((prev) =>
+              prev.map((s) =>
+                s.name === svcName
+                  ? {
+                      ...s,
+                      status: isPassed ? 'passed' : 'failed',
+                      optimization: payload.optimization,
+                      iterations: payload.optimization?.iterations || s.iterations || [],
+                      metrics: payload.metrics,
+                      error: payload.error,
+                      stages: isPassed
+                        ? {
+                            deploy: 'completed',
+                            pod_kill: 'completed',
+                            five_chaos: 'completed',
+                            node_failure: 'completed',
+                          }
+                        : s.stages,
+                    }
+                  : s
+              )
+            )
+            addLogEntry(
+              svcName,
+              isPassed ? 'success' : 'error',
+              isPassed
+                ? `✔ Service ${svcName} completed resilience evaluation.`
+                : `✖ Service ${svcName} failed: ${payload.error || 'Execution failure'}`
+            )
+          } else if (event === 'aggregate_complete') {
+            addLogEntry(null, 'success', '═══════════════════════════════════════════════════════')
+            addLogEntry(
+              null,
+              'success',
+              `🎉 All ${payload.total} microservices evaluated successfully.`
+            )
+            addLogEntry(null, 'success', '═══════════════════════════════════════════════════════')
+          } else if (event === 'error') {
+            addLogEntry(null, 'error', `Environment simulation failed: ${payload.message}`)
+          }
         })
       }
-    } catch (error) {
-      if (error.name !== 'AbortError') addLog('error', error.message)
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        addLogEntry(null, 'error', `Execution error: ${err.message}`)
+      }
     } finally {
       controllerRef.current = null
       setRunning(false)
@@ -89,28 +276,648 @@ function App() {
 
   const stopExperiment = () => {
     if (!controllerRef.current) return
-    addLog('command', '$ STOP environment orchestrator')
+    addLogEntry(null, 'command', '$ STOP environment orchestrator')
     controllerRef.current.abort()
   }
 
+  // Active inspected service details
+  const activeService = useMemo(
+    () => services.find((s) => s.name === selectedServiceName) || services[0] || null,
+    [services, selectedServiceName]
+  )
+
+  // Filtered services for left sidebar list
+  const filteredServices = useMemo(() => {
+    if (serviceFilter === 'all') return services
+    return services.filter((s) => s.status === serviceFilter)
+  }, [services, serviceFilter])
+
+  // Count aggregates
+  const counts = useMemo(() => {
+    const total = services.length
+    const passed = services.filter((s) => s.status === 'passed').length
+    const failed = services.filter((s) => s.status === 'failed').length
+    const runningCount = services.filter((s) => s.status === 'running').length
+    const waiting = services.filter((s) => s.status === 'waiting').length
+    return { total, passed, failed, runningCount, waiting }
+  }, [services])
+
+  // Logs to show based on tab
+  const displayedLogs = useMemo(() => {
+    let source = []
+    if (activeLogTab === 'service') {
+      source = (activeService && serviceLogs[activeService.name]) || []
+    } else {
+      source = globalLogs
+    }
+    if (!logFilterQuery.trim()) return source
+    const query = logFilterQuery.toLowerCase()
+    return source.filter((item) => item.text.toLowerCase().includes(query))
+  }, [activeLogTab, activeService, serviceLogs, globalLogs, logFilterQuery])
+
+  // Auto-scroll terminal when new logs arrive, ONLY for currently running service or global console
+  useEffect(() => {
+    if (!autoScroll || !terminalBottomRef.current) return
+
+    // If viewing a specific service, only scroll if that service is actively running
+    if (activeLogTab === 'service') {
+      if (activeService && activeService.status === 'running') {
+        terminalBottomRef.current.scrollIntoView({ behavior: 'smooth' })
+      }
+    } else {
+      // If viewing global console, scroll down when new logs arrive
+      terminalBottomRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [displayedLogs.length, activeLogTab, activeService?.status, autoScroll])
+
   return (
     <main className="app-shell">
-      <header className="topbar"><div className="brand-lockup"><div className="brand-mark">AK</div><div><strong>AI K8s Twin</strong><span>resilience control plane</span></div></div><div className="connection"><span className="pulse" />LOCAL CLUSTER <b>dev</b></div></header>
-      <section className="intro"><div><p className="eyebrow">ENVIRONMENT ORCHESTRATOR / 01</p><h1>Chaos, made <em>observable.</em></h1><p className="lede">Provide the workload inputs, run the orchestrator, and watch every terminal message arrive from the backend.</p></div></section>
-      <form className="workspace" onSubmit={runExperiment}>
-        <div className="experiments-panel panel"><div className="panel-heading"><div><span className="section-number">01</span><h2>Run configuration</h2></div></div>
-          <label>GitHub repository URL<input name="github_url" value={form.github_url} onChange={update} placeholder="https://github.com/org/repository" required /></label>
-          <div className="input-grid"><label>Available CPU<input name="cpu" value={form.cpu} onChange={update} required /></label><label>Available memory<input name="memory" value={form.memory} onChange={update} required /></label><label>k6 VUs<input name="vus" type="number" min="1" value={form.vus} onChange={update} required /></label><label>Duration<input name="duration" value={form.duration} onChange={update} required /></label></div>
-          <div className="panel-heading environment-heading"><div><span className="section-number">02</span><h2>Environment sequence</h2></div><span className="count-label">{selected.length} selected</span></div>
-          <div className="environment-options">{environments.map(([name, shortName, description]) => <label className="environment-option" key={name}><input type="checkbox" checked={selected.includes(name)} onChange={() => toggleEnvironment(name)} /><span><strong>{name}</strong><small>{description}</small></span><code>{shortName}.yaml</code></label>)}</div>
-          <div className="run-actions">
-            <button className="run-button" type="submit" disabled={running || selected.length === 0}><span>{running ? 'Orchestrator running' : 'Run environment orchestrator'}</span><b>{running ? '...' : '->'}</b></button>
-            {running && <button className="stop-button" type="button" onClick={stopExperiment}>Stop execution <b>×</b></button>}
+      {/* Topbar */}
+      <header className="topbar">
+        <div className="brand-lockup">
+          <div className="brand-mark">AK</div>
+          <div>
+            <strong>AI K8s Twin</strong>
+            <span>Microservice Resilience &amp; Right-Sizing Engine</span>
           </div>
         </div>
-      </form>
-      <section className="terminal-panel panel"><div className="terminal-heading"><div><span className="section-number">03</span><h2>Terminal output</h2></div><span className="terminal-path">backend stream <i>{running ? '● connected' : '● ready'}</i></span></div><div className="terminal-window"><div className="terminal-bar"><span /><span /><span /><strong>environment-orchestrator</strong></div><div className="terminal-content">{logs.map(([type, message], index) => <div className={`log-line log-${type}`} key={`${index}-${message}`}><span className="log-symbol">{type === 'command' ? '$' : type === 'success' ? '+' : type === 'error' ? '!' : '>'}</span><span>{message}</span></div>)}{running && <div className="log-line log-cursor"><span className="log-symbol">&gt;</span><span className="typing">waiting for backend output<span>_</span></span></div>}</div></div></section>
-      <footer><span>AI K8s Twin</span><span>environment orchestration laboratory</span><span>v0.1 / local</span></footer>
+        <div className="connection">
+          <span className={`pulse ${running ? 'pulse-active' : ''}`} />
+          LOCAL MINIKUBE <b>{running ? 'SIMULATING' : 'READY'}</b>
+        </div>
+      </header>
+
+      {/* Hero Intro */}
+      <section className="intro">
+        <div>
+          <p className="eyebrow">RESILIENCE DASHBOARD / v0.2</p>
+          <h1>
+            Chaos, made <em>service-aware.</em>
+          </h1>
+          <p className="lede">
+            Discover all Kubernetes microservices in your repo, run compound chaos sequences, and
+            isolate per-service self-healing performance with right-sizing recommendations.
+          </p>
+        </div>
+        <div className="intro-stats">
+          <div className="stat-box">
+            <span>DISCOVERED</span>
+            <strong>{counts.total}</strong>
+            <small>Workloads</small>
+          </div>
+          <div className="stat-box">
+            <span>PASSED SLA</span>
+            <strong className="stat-green">{counts.passed}</strong>
+            <small>Services</small>
+          </div>
+        </div>
+      </section>
+
+      {/* Collapsible Run Configuration Panel */}
+      <section className="panel config-panel">
+        <div
+          className="panel-heading config-heading"
+          onClick={() => setConfigCollapsed(!configCollapsed)}
+          style={{ cursor: 'pointer' }}
+        >
+          <div>
+            <span className="section-number">01</span>
+            <h2>Run Configuration &amp; Chaos Pipeline</h2>
+          </div>
+          <div className="config-heading-right">
+            <span className="count-label">{selectedEnvironments.length} chaos environments</span>
+            <button
+              type="button"
+              className="toggle-config-btn"
+              onClick={(e) => {
+                e.stopPropagation()
+                setConfigCollapsed(!configCollapsed)
+              }}
+            >
+              {configCollapsed ? '▼ Expand Settings' : '▲ Collapse Settings'}
+            </button>
+          </div>
+        </div>
+
+        {!configCollapsed && (
+          <form className="config-form" onSubmit={runExperiment}>
+            <div className="form-group">
+              <label>
+                GitHub Repository URL
+                <div className="input-with-action">
+                  <input
+                    name="github_url"
+                    value={form.github_url}
+                    onChange={updateField}
+                    placeholder="https://github.com/org/repository"
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="quick-sample-btn"
+                    onClick={() =>
+                      setForm((prev) => ({
+                        ...prev,
+                        github_url:
+                          'https://github.com/GoogleCloudPlatform/microservices-demo.git',
+                      }))
+                    }
+                  >
+                    Google Microservices Demo
+                  </button>
+                </div>
+              </label>
+            </div>
+
+            <div className="input-grid">
+              <label>
+                Available CPU
+                <input name="cpu" value={form.cpu} onChange={updateField} required />
+              </label>
+              <label>
+                Available Memory
+                <input name="memory" value={form.memory} onChange={updateField} required />
+              </label>
+              <label>
+                k6 VUs
+                <input
+                  name="vus"
+                  type="number"
+                  min="1"
+                  value={form.vus}
+                  onChange={updateField}
+                  required
+                />
+              </label>
+              <label>
+                Duration
+                <input name="duration" value={form.duration} onChange={updateField} required />
+              </label>
+            </div>
+
+            <div className="form-group mode-select-group">
+              <label>
+                Optimization Strategy
+                <select name="mode" value={form.mode} onChange={updateField}>
+                  <option value="binary_search">
+                    Binary Search Optimizer (Auto-Tune &amp; Right-Sizing Limits)
+                  </option>
+                  <option value="heuristic">Heuristic Single-Run (Fast Deterministic)</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="environment-selection">
+              <span className="env-title">Select Chaos Sequence:</span>
+              <div className="environment-options">
+                {CHAOS_ENVIRONMENTS.map(([name, shortName, description]) => (
+                  <label className="environment-option" key={name}>
+                    <input
+                      type="checkbox"
+                      checked={selectedEnvironments.includes(name)}
+                      onChange={() => toggleEnvironment(name)}
+                    />
+                    <span>
+                      <strong>{name}</strong>
+                      <small>{description}</small>
+                    </span>
+                    <code>{shortName}.yaml</code>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="run-actions">
+              <button
+                className="run-button"
+                type="submit"
+                disabled={running || selectedEnvironments.length === 0}
+              >
+                <span>
+                  {running ? 'Resilience Simulation Running...' : 'Run Resilience Orchestrator'}
+                </span>
+                <b>{running ? '⏳' : '→'}</b>
+              </button>
+              {running && (
+                <button className="stop-button" type="button" onClick={stopExperiment}>
+                  Stop Execution <b>×</b>
+                </button>
+              )}
+            </div>
+          </form>
+        )}
+      </section>
+
+      {/* Aggregate Progress Overview Bar */}
+      {services.length > 0 && (
+        <section className="overview-strip">
+          <div className="overview-counts">
+            <span className="overview-label">Workload Progress:</span>
+            <span className="badge badge-neutral">Total: {counts.total}</span>
+            <span className="badge badge-running">Running: {counts.runningCount}</span>
+            <span className="badge badge-passed">Passed: {counts.passed}</span>
+            <span className="badge badge-failed">Failed: {counts.failed}</span>
+            <span className="badge badge-waiting">Queued: {counts.waiting}</span>
+          </div>
+
+          <div className="filter-tabs">
+            <span>Filter:</span>
+            {['all', 'running', 'passed', 'failed'].map((f) => (
+              <button
+                key={f}
+                type="button"
+                className={`filter-btn ${serviceFilter === f ? 'active' : ''}`}
+                onClick={() => setServiceFilter(f)}
+              >
+                {f.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Main Service-Wise Grid & Inspector Layout */}
+      <div className="dashboard-grid">
+        {/* Left Column: Microservice Cards */}
+        <section className="services-column panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-number">02</span>
+              <h2>Microservice Resilience Grid</h2>
+            </div>
+            <span className="count-label">
+              {filteredServices.length} / {services.length} shown
+            </span>
+          </div>
+
+          {services.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">☸</div>
+              <h3>No Workloads Discovered Yet</h3>
+              <p>
+                Start an orchestrator run above. Once the repository is cloned and manifests are
+                parsed, microservices will appear here in real-time.
+              </p>
+            </div>
+          ) : (
+            <div className="services-list">
+              {filteredServices.map((svc) => {
+                const isSelected = selectedServiceName === svc.name
+                const hasOptimization = Boolean(svc.optimization)
+                const recMem = svc.optimization?.recommended_config?.memory_limit
+                const recCpu = svc.optimization?.recommended_config?.cpu_limit
+
+                return (
+                  <div
+                    key={svc.name}
+                    className={`service-card ${isSelected ? 'is-selected' : ''} status-${svc.status}`}
+                    onClick={() => {
+                      isUserInspectingRef.current = true
+                      setSelectedServiceName(svc.name)
+                    }}
+                  >
+                    <div className="card-top">
+                      <div className="card-identity">
+                        <strong>{svc.name}</strong>
+                        <span className="card-meta">
+                          {svc.kind} • {svc.namespace}
+                        </span>
+                      </div>
+                      <span className={`status-pill pill-${svc.status}`}>
+                        {svc.status === 'running' && <span className="spinner" />}
+                        {svc.status.toUpperCase()}
+                      </span>
+                    </div>
+
+                    {/* Stage Pipeline Chips */}
+                    <div className="stages-pipeline">
+                      {STAGE_KEYS.map(({ key, label }) => {
+                        const stageStatus = svc.stages[key] || 'pending'
+                        return (
+                          <div key={key} className={`stage-step step-${stageStatus}`} title={`${label}: ${stageStatus}`}>
+                            <span className="step-dot">
+                              {stageStatus === 'completed'
+                                ? '✓'
+                                : stageStatus === 'failed'
+                                ? '✕'
+                                : stageStatus === 'running'
+                                ? '⏳'
+                                : '○'}
+                            </span>
+                            <span className="step-label">{label}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+
+                    {/* Sizing recommendation teaser */}
+                    {hasOptimization && (
+                      <div className="sizing-teaser">
+                        <span className="sizing-tag">Right-Sized:</span>
+                        <code>
+                          {recMem} RAM • {recCpu} CPU
+                        </code>
+                      </div>
+                    )}
+
+                    {/* Iteration Count & Safe Tolerance Tag */}
+                    {(svc.iterations?.length > 0 || svc.optimization?.iterations?.length > 0) && (
+                      <div className="iterations-card-badge">
+                        <span className="iter-count-tag">
+                          ITERATIONS: {(svc.iterations || svc.optimization?.iterations || []).length}
+                        </span>
+                        {svc.optimization?.max_safe_tolerance && (
+                          <span className="safe-tol-tag">
+                            SAFE: <code>{svc.optimization.max_safe_tolerance}</code>
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* Right Column: Service Inspector & Logs */}
+        <section className="inspector-column panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-number">03</span>
+              <h2>Workload Inspector &amp; Telemetry</h2>
+            </div>
+            {activeService && (
+              <span className="active-service-tag">{activeService.name}</span>
+            )}
+          </div>
+
+          {activeService ? (
+            <div className="inspector-body">
+              {/* Service Header & Sizing Card */}
+              <div className="inspector-summary-card">
+                <div className="inspector-header">
+                  <div>
+                    <h3>{activeService.name}</h3>
+                    <p className="service-sub">
+                      Namespace: <code>{activeService.namespace}</code> | Kind:{' '}
+                      <code>{activeService.kind}</code>
+                    </p>
+                  </div>
+                  <span className={`status-pill pill-${activeService.status}`}>
+                    {activeService.status.toUpperCase()}
+                  </span>
+                </div>
+
+                {/* Resilience & Right-Sizing Insights */}
+                {activeService.optimization ? (
+                  <div className="optimization-insights">
+                    <div
+                      className={`sla-banner ${
+                        activeService.optimization.sla_passed ? 'sla-pass' : 'sla-fail'
+                      }`}
+                    >
+                      <span className="sla-icon">
+                        {activeService.optimization.sla_passed ? '[PASS]' : '[BREACH]'}
+                      </span>
+                      <div>
+                        <strong>
+                          SLA Verdict:{' '}
+                          {activeService.optimization.sla_passed ? 'PASSED' : 'BREACHED'}
+                        </strong>
+                        <p>{activeService.optimization.sla_verdict}</p>
+                      </div>
+                    </div>
+
+                    <div className="sizing-comparison-grid">
+                      <div className="sizing-box">
+                        <span className="box-title">Recommended Memory</span>
+                        <strong className="box-value highlight-val">
+                          {activeService.optimization.recommended_config?.memory_limit || 'N/A'}
+                        </strong>
+                        <small>Auto-calculated +25% buffer</small>
+                      </div>
+                      <div className="sizing-box">
+                        <span className="box-title">Recommended CPU</span>
+                        <strong className="box-value highlight-val">
+                          {activeService.optimization.recommended_config?.cpu_limit || 'N/A'}
+                        </strong>
+                        <small>Auto-calculated +25% buffer</small>
+                      </div>
+                      <div className="sizing-box">
+                        <span className="box-title">Max Memory Observed</span>
+                        <strong className="box-value">
+                          {activeService.metrics?.memory_max
+                            ? `${Math.round(activeService.metrics.memory_max / (1024 * 1024))} MiB`
+                            : 'N/A'}
+                        </strong>
+                        <small>During compound chaos</small>
+                      </div>
+                      <div className="sizing-box">
+                        <span className="box-title">Max CPU Observed</span>
+                        <strong className="box-value">
+                          {activeService.metrics?.cpu_max
+                            ? `${(activeService.metrics.cpu_max * 1000).toFixed(0)}m`
+                            : 'N/A'}
+                        </strong>
+                        <small>During compound chaos</small>
+                      </div>
+                    </div>
+                  </div>
+                ) : activeService.error ? (
+                  <div className="error-banner">
+                    <strong>Failure Details:</strong>
+                    <pre>{activeService.error}</pre>
+                  </div>
+                ) : (
+                  <div className="pending-insights">
+                    <span>Resilience evaluation in progress... Telemetry will update dynamically.</span>
+                  </div>
+                )}
+
+                {/* Iterative Binary Search Convergence Stream */}
+                {(activeService.iterations?.length > 0 || activeService.optimization?.iterations?.length > 0) && (
+                  <div className="convergence-section">
+                    <div className="convergence-header">
+                      <div className="convergence-title-group">
+                        <span className="indicator-pip" />
+                        <h4>BINARY SEARCH OPTIMIZATION STREAM</h4>
+                      </div>
+                      <span className="convergence-count">
+                        {(activeService.iterations || activeService.optimization?.iterations || []).length} TRIALS RECORDED
+                      </span>
+                    </div>
+
+                    <div className="trial-stream-container">
+                      {(activeService.iterations || activeService.optimization?.iterations || []).map((iter) => {
+                        const isPass = iter.sla_passed ?? iter.passed
+                        const diffVal = iter.difference !== undefined ? iter.difference : (iter.new_bounds ? Math.abs(parseInt(iter.new_bounds[1]) - parseInt(iter.new_bounds[0])) : null)
+                        const vector = iter.chaos_vector || {}
+
+                        return (
+                          <div key={iter.iteration} className={`trial-card ${isPass ? 'trial-pass' : 'trial-fail'}`}>
+                            {/* Card Top: Header & Verdict */}
+                            <div className="trial-card-top">
+                              <div className="trial-meta-left">
+                                <span className="trial-index-tag">TRIAL {String(iter.iteration).padStart(2, '0')}</span>
+                                <span className={`trial-status-badge ${isPass ? 'status-pass' : 'status-fail'}`}>
+                                  {isPass ? 'PASSED' : 'BREACHED'}
+                                </span>
+                                {iter.reason && <span className="trial-reason-text">{iter.reason}</span>}
+                              </div>
+                              <div className="trial-meta-right">
+                                <span className={`delta-tag ${diffVal !== null && diffVal <= 16 ? 'delta-converged' : ''}`}>
+                                  DELTA: {diffVal !== null ? `${diffVal}M` : 'N/A'} {diffVal !== null && diffVal <= 16 ? '(CONVERGED)' : ''}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Middle: 5-Chaos Vector Bar */}
+                            <div className="trial-vector-row">
+                              <span className="vector-label">APPLIED 5-CHAOS:</span>
+                              <div className="vector-chips-group">
+                                <span className="vector-chip chip-highlight" title="Target Stress Parameter">
+                                  <span className="chip-key">RAM</span>
+                                  <code className="chip-val">{vector.memory || iter.tested_value || iter.display}</code>
+                                </span>
+                                <span className="vector-chip">
+                                  <span className="chip-key">CPU</span>
+                                  <code className="chip-val">{vector.cpu || '60%'}</code>
+                                </span>
+                                <span className="vector-chip">
+                                  <span className="chip-key">DELAY</span>
+                                  <code className="chip-val">{vector.delay || '100ms'}</code>
+                                </span>
+                                <span className="vector-chip">
+                                  <span className="chip-key">LOSS</span>
+                                  <code className="chip-val">{vector.loss || '3%'}</code>
+                                </span>
+                                <span className="vector-chip">
+                                  <span className="chip-key">PARTITION</span>
+                                  <code className="chip-val">{vector.partition || activeService.name}</code>
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Bottom: Decision Step & Bounds */}
+                            <div className="trial-card-bottom">
+                              <div className="step-decision-text">
+                                <span className="step-prefix">&gt;</span>
+                                <span className="step-detail">{iter.step_taken}</span>
+                              </div>
+                              <div className="midpoint-next-tag">
+                                {iter.next_midpoint && !iter.converged ? (
+                                  <span>NEXT MIDPOINT: <code>{iter.next_midpoint}</code></span>
+                                ) : (
+                                  <span className="converged-final-tag">CONVERGED AT {activeService.optimization?.max_safe_tolerance || iter.tested_value}</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Terminal Window with Log Partitioning */}
+              <div className="terminal-container">
+                <div className="terminal-tabs-bar">
+                  <div className="tab-buttons">
+                    <button
+                      type="button"
+                      className={`tab-btn ${activeLogTab === 'service' ? 'active' : ''}`}
+                      onClick={() => setActiveLogTab('service')}
+                    >
+                      {activeService.name} Logs ({serviceLogs[activeService.name]?.length || 0})
+                    </button>
+                    <button
+                      type="button"
+                      className={`tab-btn ${activeLogTab === 'all' ? 'active' : ''}`}
+                      onClick={() => setActiveLogTab('all')}
+                    >
+                      Global Console ({globalLogs.length})
+                    </button>
+                  </div>
+
+                  <div className="terminal-tools">
+                    <button
+                      type="button"
+                      className={`autoscroll-toggle-btn ${autoScroll ? 'active' : ''}`}
+                      onClick={() => setAutoScroll(!autoScroll)}
+                      title="Toggle auto-scroll to bottom"
+                    >
+                      {autoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
+                    </button>
+                    <input
+                      type="text"
+                      className="log-search-input"
+                      placeholder="Filter logs..."
+                      value={logFilterQuery}
+                      onChange={(e) => setLogFilterQuery(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="terminal-window">
+                  <div className="terminal-bar">
+                    <span />
+                    <span />
+                    <span />
+                    <strong>
+                      {activeLogTab === 'service' ? activeService.name : 'all-workloads'} :: stream
+                    </strong>
+                  </div>
+
+                  <div className="terminal-content">
+                    {displayedLogs.length === 0 ? (
+                      <div className="empty-terminal-text">
+                        No log entries found for this view.
+                      </div>
+                    ) : (
+                      displayedLogs.map((entry, idx) => (
+                        <div key={idx} className={`log-line log-${entry.type}`}>
+                          <span className="log-symbol">
+                            {entry.type === 'command'
+                              ? '$'
+                              : entry.type === 'success'
+                              ? '✓'
+                              : entry.type === 'error'
+                              ? '!'
+                              : '>'}
+                          </span>
+                          <span className="log-text">{entry.text}</span>
+                        </div>
+                      ))
+                    )}
+                    {running && (
+                      <div className="log-line log-cursor">
+                        <span className="log-symbol">&gt;</span>
+                        <span className="typing">
+                          streaming backend output<span>_</span>
+                        </span>
+                      </div>
+                    )}
+                    <div ref={terminalBottomRef} />
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <p>Select a microservice on the left to inspect its logs and resilience SLA verdict.</p>
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* Footer */}
+      <footer>
+        <span>AI K8s Twin</span>
+        <span>Microservice Resilience &amp; Right-Sizing Control Plane</span>
+        <span>v0.2 / Local Minikube</span>
+      </footer>
     </main>
   )
 }

@@ -8,7 +8,12 @@ import time
 
 import yaml
 from git import Repo
-from groq import Groq
+from services.binary_search_service import (
+    generate_heuristic_parameters,
+    calculate_bounds,
+    evaluate_sla,
+    BinarySearchSession
+)
 from jinja2 import Environment, FileSystemLoader
 from dotenv import load_dotenv
 
@@ -655,13 +660,18 @@ def deploy_application(
                         break
 
         if service_account is None:
-
-            raise RuntimeError(
-                f"ServiceAccount "
-                f"{service_account_name} "
-                f"was not found in "
-                f"{release_file}"
+            print(
+                f"ServiceAccount {service_account_name} not found in release file. "
+                f"Creating synthetic ServiceAccount..."
             )
+            service_account = {
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": service_account_name,
+                    "namespace": namespace
+                }
+            }
 
         documents.append(
             service_account
@@ -752,7 +762,7 @@ def deploy_application(
         f"{kind.lower()}/{name}",
         "-n",
         namespace,
-        "--timeout=180s"
+        "--timeout=60s"
     ])
 
     print(
@@ -804,117 +814,15 @@ def generate_environment_parameters(
     vus,
     duration
 ):
-
-    client = Groq(
-        api_key=os.environ.get(
-            "GROQ_API_KEY"
-        )
+    print("Using Deterministic Engine for chaos parameter calculation...")
+    return generate_heuristic_parameters(
+        application=application,
+        environments=environments,
+        cpu=cpu,
+        memory=memory,
+        vus=vus,
+        duration=duration
     )
-
-    prompt = f"""
-You are generating parameters for Kubernetes
-chaos engineering experiments.
-
-Application:
-{json.dumps(application, indent=2)}
-    duration,
-    vus
-Selected environments:
-{json.dumps(environments, indent=2)}
-        vus,
-User available CPU:
-{cpu}
-
-User available memory:
-{memory}
-
-k6 VUs:
-{vus}
-
-Experiment duration:
-{duration}
-
-Rules:
-
-1. Do not choose environments.
-2. Do not add environments.
-3. Do not remove environments.
-4. Return exactly one parameter object for
-   every selected environment.
-5. Do not generate Kubernetes YAML.
-6. Return parameters only.
-7. Return valid JSON only.
-8. CPU Stress value must be numeric from 1 to 100.
-9. Memory Stress must use M as the unit.
-10. Memory Stress must not exceed the application's
-    memory limit when a memory limit exists.
-11. Network Delay must use ms or s.
-12. Network Loss must be numeric only.
-13. Network Loss must be greater than 0 and at most 100.
-14. Network Partition should return a simple value such as
-    "1". The actual source and target applications are
-    controlled by the system.
-15. Pod Kill should return a simple value such as "1".
-    The actual target application is controlled by the system.
-16. Node Failure should return a simple value such as "1".
-    The actual node is controlled by the system.
-17. Consider the application's CPU, memory, ports,
-    labels and containers.
-18. Keep values reasonable for a Kubernetes
-    chaos experiment.
-
-Return exactly this structure:
-
-{{
-  "environments": {{
-    "environment name": {{
-      "value": "parameter"
-    }}
-  }}
-}}
-"""
-
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0
-    )
-
-    content = (
-        response.choices[0]
-        .message
-        .content
-        .strip()
-    )
-
-    try:
-
-        return json.loads(
-            content
-        )
-
-    except json.JSONDecodeError:
-
-        match = re.search(
-            r"\{.*\}",
-            content,
-            re.DOTALL
-        )
-
-        if not match:
-
-            raise RuntimeError(
-                "LLM did not return valid JSON."
-            )
-
-        return json.loads(
-            match.group(0)
-        )
 
 
 def parse_memory(value):
@@ -2988,7 +2896,10 @@ def process_application(
     cpu,
     memory,
     vus,
-    duration
+    duration,
+    mode="binary_search",
+    event_emitter=None,
+    **kwargs
 ):
 
     name = application.get(
@@ -3020,9 +2931,23 @@ def process_application(
             "\nDeploying application..."
         )
 
+        if event_emitter:
+            event_emitter.emit("stage_update", {
+                "service": name,
+                "stage": "deploy",
+                "status": "running"
+            })
+
         deployment_result = deploy_application(
             application
         )
+
+        if event_emitter:
+            event_emitter.emit("stage_update", {
+                "service": name,
+                "stage": "deploy",
+                "status": "completed"
+            })
 
         llm_application = (
             prepare_llm_application(
@@ -3143,6 +3068,13 @@ def process_application(
             f"{pod_kill_file}"
         )
 
+        if event_emitter:
+            event_emitter.emit("stage_update", {
+                "service": name,
+                "stage": "pod_kill",
+                "status": "running"
+            })
+
         pod_kill_result = (
             execute_pod_kill(
                 application,
@@ -3156,168 +3088,271 @@ def process_application(
             "pod_kill"
         ] = pod_kill_result
 
-        five_chaos_parameters = {}
+        if event_emitter:
+            event_emitter.emit("stage_update", {
+                "service": name,
+                "stage": "pod_kill",
+                "status": "completed",
+                "details": pod_kill_result
+            })
 
-        for environment in FIVE_CHAOS_ENVIRONMENTS:
+        # --------------------------------
+        # Binary Search Optimization Loop (Stage 2)
+        # --------------------------------
+        effective_mode = mode if mode in ["binary_search", "heuristic"] else "binary_search"
+        bounds = calculate_bounds(application, cpu, memory)
+        mem_bounds = bounds.get("Memory Stress", {"low": 16, "high": 128, "unit": "M", "threshold": 16})
 
-            if environment in environments:
+        session = BinarySearchSession(
+            parameter_name="Memory Stress",
+            low=mem_bounds["low"],
+            high=mem_bounds["high"],
+            unit=mem_bounds.get("unit", "M"),
+            threshold=mem_bounds.get("threshold", 16),
+            max_iterations=8 if effective_mode == "binary_search" else 1
+        )
 
-                five_chaos_parameters[
-                    environment
-                ] = chaos_parameters[
-                    environment
-                ]
+        best_five_chaos_result = None
+        best_metrics = None
+        last_five_chaos_file = None
 
-        missing = [
-            environment
-            for environment
-            in FIVE_CHAOS_ENVIRONMENTS
-            if environment not in environments
-        ]
+        print(f"\n========================================")
+        print(f"RESILIENCE & OPTIMIZATION LOOP ({name})")
+        print(f"Mode: {effective_mode} | Convergence Rule: (High - Low) <= {session.threshold}{session.unit}")
+        print(f"Search Bounds: [{session.low}{session.unit}, {session.high}{session.unit}]")
+        print(f"========================================")
 
-        if missing:
+        while not session.converged and session.iteration < session.max_iterations:
+            current_mid = session.next_value()
+            current_iter = session.iteration + 1
+            print(f"\n--- [Iteration {current_iter}] Testing Memory Stress: {current_mid}{session.unit} (Bounds: [{session.low}{session.unit}, {session.high}{session.unit}], Diff: {session.high - session.low}{session.unit}) ---")
 
-            raise RuntimeError(
-                "The five-chaos stage is missing: "
-                + ", ".join(missing)
+            if "Memory Stress" in parameters.get("environments", {}):
+                parameters["environments"]["Memory Stress"]["value"] = f"{current_mid}{session.unit}"
+
+            iter_chaos_parameters = build_chaos_parameters(
+                application=application,
+                environments=environments,
+                parameters=parameters,
+                duration=duration
             )
 
-        generated_five_chaos = (
-            generate_compound_chaos_yaml(
+            five_chaos_parameters = {
+                env: iter_chaos_parameters[env]
+                for env in FIVE_CHAOS_ENVIRONMENTS
+                if env in iter_chaos_parameters
+            }
+
+            iter_five_chaos_yaml = generate_compound_chaos_yaml(
                 FIVE_CHAOS_ENVIRONMENTS,
                 five_chaos_parameters
             )
-        )
 
-        five_chaos_file = os.path.join(
-            GENERATED_DIRECTORY,
-            f"{name}-five-chaos.yaml"
-        )
+            iter_five_chaos_file = os.path.join(
+                GENERATED_DIRECTORY,
+                f"{name}-five-chaos-iter{current_iter}.yaml"
+            )
+            write_yaml_file(iter_five_chaos_file, iter_five_chaos_yaml)
+            last_five_chaos_file = iter_five_chaos_file
 
-        write_yaml_file(
-            five_chaos_file,
-            generated_five_chaos
-        )
+            # Capture 5-chaos stress vector applied in this trial
+            chaos_vector = {
+                "memory": f"{current_mid}{session.unit}",
+                "cpu": f"{five_chaos_parameters.get('CPU Stress', {}).get('cpu_load', '60')}%",
+                "delay": str(five_chaos_parameters.get("Network Delay", {}).get("latency", "100ms")),
+                "loss": f"{five_chaos_parameters.get("Network Loss", {}).get("loss_percent", "3")}%",
+                "partition": str(five_chaos_parameters.get("Network Partition", {}).get("target_app", name))
+            }
 
-        print(
-            f"\nGenerated five-chaos YAML: "
-            f"{five_chaos_file}"
-        )
+            if event_emitter:
+                event_emitter.emit("stage_update", {
+                    "service": name,
+                    "stage": "five_chaos",
+                    "status": "running",
+                    "iteration": current_iter,
+                    "max_iterations": session.max_iterations,
+                    "tested_value": f"{current_mid}{session.unit}"
+                })
 
-        five_chaos_result = (
-            execute_five_chaos(
+            five_chaos_result = execute_five_chaos(
                 application,
-                five_chaos_file,
+                iter_five_chaos_file,
                 duration,
                 vus
             )
-        )
 
-        result[
-            "stages"
-        ][
-            "five_chaos"
-        ] = five_chaos_result
+            iter_metrics = collect_result_metrics(
+                application,
+                pod_kill_result,
+                five_chaos_result.get("k6")
+            )
 
-        node_failure_parameters = {
-            "Node Failure": chaos_parameters[
-                "Node Failure"
-            ]
-        }
+            k6_stage = five_chaos_result.get("k6", {})
+            sla_passed, sla_reason = evaluate_sla(k6_stage, iter_metrics)
 
-        node_failure_yaml = (
-            generate_chaos_yaml(
+            step_entry = session.record_result(current_mid, sla_passed, sla_reason, chaos_vector=chaos_vector)
+
+            print(f"Iteration {current_iter} Result: {'PASSED' if sla_passed else 'BREACHED'} ({sla_reason})")
+            print(f"Decision Step: {step_entry['step_taken']} (Remaining Delta: {step_entry['difference_str']})")
+
+            if sla_passed or best_five_chaos_result is None:
+                best_five_chaos_result = five_chaos_result
+                best_metrics = iter_metrics
+
+            if event_emitter:
+                event_emitter.emit("iteration_update", {
+                    "service": name,
+                    "iteration": step_entry["iteration"],
+                    "max_iterations": session.max_iterations,
+                    "parameter": step_entry["parameter"],
+                    "tested_value": step_entry["tested_value"],
+                    "previous_bounds": step_entry["previous_bounds"],
+                    "sla_passed": step_entry["passed"],
+                    "reason": step_entry["reason"],
+                    "step_taken": step_entry["step_taken"],
+                    "new_bounds": step_entry["new_bounds"],
+                    "difference": step_entry["difference"],
+                    "difference_str": step_entry["difference_str"],
+                    "next_midpoint": step_entry["next_midpoint"],
+                    "converged": step_entry["converged"],
+                    "chaos_vector": chaos_vector
+                })
+
+            if effective_mode == "heuristic":
+                session.converged = True
+                break
+
+            if not session.converged:
+                time.sleep(2)
+
+        result["stages"]["five_chaos"] = best_five_chaos_result
+
+        if event_emitter:
+            event_emitter.emit("stage_update", {
+                "service": name,
+                "stage": "five_chaos",
+                "status": "completed",
+                "details": best_five_chaos_result
+            })
+
+        node_failure_result = None
+        node_failure_file = None
+        if "Node Failure" in environments and "Node Failure" in chaos_parameters:
+            node_failure_parameters = {
+                "Node Failure": chaos_parameters["Node Failure"]
+            }
+
+            node_failure_yaml = generate_chaos_yaml(
                 "Node Failure",
-                node_failure_parameters[
-                    "Node Failure"
-                ]
-            )
-        )
-
-        node_failure_file = os.path.join(
-            GENERATED_DIRECTORY,
-            f"{name}-node-failure.yaml"
-        )
-
-        with open(
-            node_failure_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            file.write(
-                node_failure_yaml
+                node_failure_parameters["Node Failure"]
             )
 
-        print(
-            f"\nGenerated Node Failure YAML: "
-            f"{node_failure_file}"
-        )
+            node_failure_file = os.path.join(
+                GENERATED_DIRECTORY,
+                f"{name}-node-failure.yaml"
+            )
 
-        node_failure_result = (
-            execute_node_failure(
+            with open(node_failure_file, "w", encoding="utf-8") as file:
+                file.write(node_failure_yaml)
+
+            print(f"\nGenerated Node Failure YAML: {node_failure_file}")
+
+            if event_emitter:
+                event_emitter.emit("stage_update", {
+                    "service": name,
+                    "stage": "node_failure",
+                    "status": "running"
+                })
+
+            node_failure_result = execute_node_failure(
                 application,
                 node_failure_file,
                 duration
             )
-        )
 
-        result[
-            "stages"
-        ][
-            "node_failure"
-        ] = node_failure_result
+            result["stages"]["node_failure"] = node_failure_result
 
-        result[
-            "metrics"
-        ] = collect_result_metrics(
+            if event_emitter:
+                event_emitter.emit("stage_update", {
+                    "service": name,
+                    "stage": "node_failure",
+                    "status": "completed",
+                    "details": node_failure_result
+                })
+
+        result["metrics"] = best_metrics or collect_result_metrics(
             application,
             pod_kill_result,
-            five_chaos_result.get(
-                "k6"
-            )
+            best_five_chaos_result.get("k6") if best_five_chaos_result else None
         )
 
-        result[
-            "chaos"
-        ] = parameters
-
-        result[
-            "target_app"
-        ] = target_app
-
-        result[
-            "generated_files"
-        ] = {
+        result["chaos"] = parameters
+        result["target_app"] = target_app
+        result["generated_files"] = {
             "pod_kill": pod_kill_file,
-            "five_chaos": five_chaos_file,
+            "five_chaos": last_five_chaos_file,
             "node_failure": node_failure_file
         }
 
-        result[
-            "status"
-        ] = "completed"
+        # --------------------------------
+        # Convergence & Right-Sizing Summary
+        # --------------------------------
+        service_passed = any(it["passed"] for it in session.history)
+        peak_mem_bytes = result.get("metrics", {}).get("memory_max") or 0
+        peak_cpu_cores = result.get("metrics", {}).get("cpu_max") or 0
+
+        recommended_mem = f"{max(32, int((peak_mem_bytes * 1.25) / (1024 * 1024)))}Mi" if peak_mem_bytes else "128Mi"
+        recommended_cpu = f"{max(50, int(peak_cpu_cores * 1.25 * 1000))}m" if peak_cpu_cores else "250m"
+
+        sla_verdict = (
+            f"Optimal safe tolerance: {session.best_passing_value}{session.unit} (Converged in {session.iteration} iterations)"
+            if service_passed
+            else f"All {session.iteration} iterations breached SLA: {session.history[-1]['reason'] if session.history else 'Unknown'}"
+        )
+
+        optimization_summary = {
+            "sla_passed": service_passed,
+            "sla_verdict": sla_verdict,
+            "bounds": bounds,
+            "recommended_config": {
+                "memory_limit": recommended_mem,
+                "cpu_limit": recommended_cpu
+            },
+            "max_safe_tolerance": f"{session.best_passing_value}{session.unit}" if service_passed else "0M",
+            "iterations": session.history,
+            "summary": session.summary()
+        }
+        result["optimization"] = optimization_summary
+
+        print("\n========================================")
+        print("BINARY SEARCH CONVERGENCE SUMMARY")
+        print("========================================")
+        print(f"Overall Status:        {'PASSED' if service_passed else 'FAILED'}")
+        print(f"SLA Verdict:           {sla_verdict}")
+        print(f"Max Safe Tolerance:    {session.best_passing_value}{session.unit}")
+        print(f"Recommended Limit:     {recommended_mem} Memory | {recommended_cpu} CPU")
+        print("========================================")
+
+        result["status"] = "completed"
 
         result_file = os.path.join(
             GENERATED_DIRECTORY,
             f"{name}-environment-result.json"
         )
 
-        with open(
-            result_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
+        with open(result_file, "w", encoding="utf-8") as file:
+            json.dump(result, file, indent=2)
 
-            json.dump(
-                result,
-                file,
-                indent=2
-            )
+        print(f"\nResult saved: {result_file}")
 
-        print(
-            f"\nResult saved: {result_file}"
-        )
+        if event_emitter:
+            event_emitter.emit("service_result", {
+                "service": name,
+                "status": "passed" if service_passed else "failed",
+                "optimization": optimization_summary,
+                "metrics": result.get("metrics"),
+                "stages": result.get("stages")
+            })
 
         return result
 
@@ -3336,7 +3371,10 @@ def run_environment(
     memory,
     vus,
     duration,
-    environments=None
+    environments=None,
+    mode="binary_search",
+    event_emitter=None,
+    **kwargs
 ):
 
     print(
@@ -3422,12 +3460,35 @@ def run_environment(
         f"\nDetected {len(workloads)} workloads."
     )
 
+    if event_emitter:
+        event_emitter.emit("discovery", {
+            "total": len(workloads),
+            "services": [
+                {
+                    "name": w.get("name"),
+                    "namespace": w.get("namespace", "default"),
+                    "kind": w.get("kind", "Deployment")
+                }
+                for w in workloads
+            ]
+        })
+
     results = []
 
     for index, application in enumerate(
         workloads,
         start=1
     ):
+        app_name = application.get("name")
+
+        if event_emitter:
+            event_emitter.active_service = app_name
+            event_emitter.emit("service_start", {
+                "service": app_name,
+                "index": index,
+                "total": len(workloads),
+                "namespace": application.get("namespace", "default")
+            })
 
         print(
             "\n----------------------------------------"
@@ -3438,7 +3499,7 @@ def run_environment(
         )
 
         print(
-            f"Name: {application.get('name')}"
+            f"Name: {app_name}"
         )
 
         print(
@@ -3458,7 +3519,9 @@ def run_environment(
                 cpu=cpu,
                 memory=memory,
                 vus=vus,
-                duration=duration
+                duration=duration,
+                mode=mode,
+                event_emitter=event_emitter
             )
 
             results.append(
@@ -3471,15 +3534,31 @@ def run_environment(
                 f"\nApplication failed: {error}"
             )
 
-            results.append({
+            metrics = collect_result_metrics(
+                application,
+                None
+            )
+
+            failed_item = {
                 "application": application,
                 "status": "failed",
                 "error": str(error),
-                "metrics": collect_result_metrics(
-                    application,
-                    None
-                )
-            })
+                "metrics": metrics
+            }
+
+            results.append(failed_item)
+
+            if event_emitter:
+                event_emitter.emit("service_result", {
+                    "service": app_name,
+                    "status": "failed",
+                    "error": str(error),
+                    "metrics": metrics
+                })
+
+        finally:
+            if event_emitter:
+                event_emitter.active_service = None
 
     aggregate_file = os.path.join(
         GENERATED_DIRECTORY,
@@ -3502,6 +3581,13 @@ def run_environment(
             file,
             indent=2
         )
+
+    if event_emitter:
+        event_emitter.emit("aggregate_complete", {
+            "status": "completed",
+            "total": len(results),
+            "results": results
+        })
 
     print(
         "\n========================================"

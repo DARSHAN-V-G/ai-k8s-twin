@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import json
 import queue
 import threading
+
+from typing import List
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from services.environment_orchestrator import run_environment
+from services.event_emitter import EventEmitter, QueueLogWriter
 
 
 app = FastAPI(title="AI K8s Twin API")
@@ -22,45 +27,53 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "AI K8s Twin API",
+        "docs": "http://localhost:8000/docs"
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+
 class EnvironmentRunRequest(BaseModel):
     github_url: str = Field(min_length=1)
     cpu: str = Field(min_length=1)
     memory: str = Field(min_length=1)
     vus: str = Field(min_length=1)
     duration: str = Field(min_length=1)
-    environments: list[str] = Field(min_length=1)
+    environments: List[str] = Field(min_length=1)
+    mode: str = "binary_search"
 
 
 def _sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-class _QueueWriter:
-    def __init__(self, events):
-        self.events = events
-
-    def write(self, text):
-        if text:
-            self.events.put(("output", {"text": text}))
-        return len(text)
-
-    def flush(self):
-        return None
-
-
 @app.post("/api/environment-orchestrator/run")
 async def start_environment_orchestrator(request: EnvironmentRunRequest):
     events = queue.Queue()
+    emitter = EventEmitter(events)
+    output = QueueLogWriter(emitter)
     sentinel = object()
 
     def execute():
-        output = _QueueWriter(events)
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                result = run_environment(**request.model_dump())
-            events.put(("result", {"status": "completed", "result": result}))
+                result = run_environment(
+                    **request.model_dump(),
+                    event_emitter=emitter,
+                )
+            emitter.emit("result", {"status": "completed", "result": result})
+            emitter.emit("aggregate_complete", {"status": "completed", "total": len(result), "results": result})
         except Exception as error:
-            events.put(("error", {"status": "failed", "message": str(error)}))
+            emitter.emit("error", {"status": "failed", "message": str(error)})
         finally:
             events.put(sentinel)
 

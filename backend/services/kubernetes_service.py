@@ -308,12 +308,18 @@ def deploy_application(application):
             )
 
         else:
-
-            raise RuntimeError(
-                f"ServiceAccount "
-                f"{service_account_name} "
-                f"was not found in repository manifests."
+            print(
+                f"ServiceAccount {service_account_name} not found in repository manifests. "
+                f"Creating synthetic ServiceAccount..."
             )
+            documents.append({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": service_account_name,
+                    "namespace": namespace
+                }
+            })
 
     if kind in {
         "Deployment",
@@ -396,7 +402,7 @@ def deploy_application(application):
         f"{workload_type}/{name}",
         "-n",
         namespace,
-        "--timeout=180s"
+        "--timeout=60s"
     ])
 
     print(rollout_output)

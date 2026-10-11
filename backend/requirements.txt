@@ -4,6 +4,5 @@ pydantic
 python-dotenv
 gitpython
 pyyaml
-groq
 requests
 jinja2
