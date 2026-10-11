@@ -12,6 +12,7 @@ from services.binary_search_service import (
     generate_heuristic_parameters,
     calculate_bounds,
     evaluate_sla,
+    calculate_recommended_config,
     BinarySearchSession,
     MultiParamSearchSession
 )
@@ -503,6 +504,78 @@ def find_application_resource(
         f"Could not find {expected_kind} "
         f"{expected_name} in repository manifests."
     )
+
+
+def generate_optimized_deployment_yaml(
+    application,
+    recommended_config,
+    optimal_tolerances=None
+):
+    """
+    Finds the application's Kubernetes resource manifest, clones it,
+    injects the recommended limits and requests, tunes probe timeouts,
+    and writes it to generated/{name}-optimized-deployment.yaml.
+    """
+    import copy
+    name = application.get("name")
+    try:
+        raw_doc = find_application_resource(application)
+        doc = copy.deepcopy(raw_doc)
+    except Exception:
+        # Fallback to minimal deployment spec
+        doc = {
+            "apiVersion": "apps/v1",
+            "kind": application.get("kind", "Deployment"),
+            "metadata": {
+                "name": name,
+                "namespace": application.get("namespace", "default"),
+                "labels": {"app": name}
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": name}},
+                "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {
+                        "containers": [{
+                            "name": "server",
+                            "image": name
+                        }]
+                    }
+                }
+            }
+        }
+
+    spec = doc.get("spec", {})
+    template_spec = spec.get("template", {}).get("spec", {}) if "template" in spec else spec
+    containers = template_spec.get("containers", [])
+    if containers:
+        container = containers[0]
+        container["resources"] = {
+            "requests": {
+                "cpu": recommended_config.get("cpu_request", "25m"),
+                "memory": recommended_config.get("memory_request", "18Mi")
+            },
+            "limits": {
+                "cpu": recommended_config.get("cpu_limit", "62m"),
+                "memory": recommended_config.get("memory_limit", "32Mi")
+            }
+        }
+        for probe_key in ["livenessProbe", "readinessProbe", "startupProbe"]:
+            if probe_key in container and isinstance(container[probe_key], dict):
+                current_timeout = container[probe_key].get("timeoutSeconds", 1)
+                container[probe_key]["timeoutSeconds"] = max(current_timeout, 2)
+
+    yaml_str = yaml.dump(doc, sort_keys=False, default_flow_style=False)
+
+    out_file = os.path.join(
+        GENERATED_DIRECTORY,
+        f"{name}-optimized-deployment.yaml"
+    )
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(yaml_str)
+
+    return yaml_str, out_file
 
 
 def deploy_application(
@@ -3118,6 +3191,10 @@ def process_application(
         best_five_chaos_result = None
         best_metrics = None
         last_five_chaos_file = None
+        initial_peak_mem = (result.get("metrics") or {}).get("memory_max") or 0
+        initial_peak_cpu = (result.get("metrics") or {}).get("cpu_max") or 0
+        baseline_mem_mb = int(initial_peak_mem / (1024 * 1024)) if initial_peak_mem else 32
+        baseline_cpu_m = int(initial_peak_cpu * 1000) if initial_peak_cpu else 50
 
         print(f"\n========================================")
         print(f"RESILIENCE & MULTI-PARAM OPTIMIZATION LOOP ({name})")
@@ -3206,6 +3283,16 @@ def process_application(
                 five_chaos_result.get("k6")
             )
 
+            if iter_metrics:
+                cur_mem = iter_metrics.get("memory_max") or 0
+                cur_cpu = iter_metrics.get("cpu_max") or 0
+                if cur_mem:
+                    baseline_mem_mb = max(baseline_mem_mb, int(cur_mem / (1024 * 1024)))
+                if cur_cpu:
+                    baseline_cpu_m = max(baseline_cpu_m, int(cur_cpu * 1000))
+
+            iter_rec_config = calculate_recommended_config(metrics=iter_metrics)
+
             k6_stage = five_chaos_result.get("k6", {})
             sla_passed, sla_reason = evaluate_sla(k6_stage, iter_metrics)
 
@@ -3214,12 +3301,14 @@ def process_application(
                 sla_passed,
                 k6_result=k6_stage,
                 metrics=iter_metrics,
-                reason=sla_reason
+                reason=sla_reason,
+                recommended_config=iter_rec_config
             )
 
             print(f"Iteration {current_iter} Result: {'PASSED' if sla_passed else 'BREACHED'} ({step_entry['reason']})")
             print(f"Culprit Dimension: {step_entry['culprit'] or 'None (All Passed)'}")
             print(f"Decision Step: {step_entry['step_taken']}")
+            print(f"Iteration Sizing Config: Memory Limit={iter_rec_config['memory_limit']}, Request={iter_rec_config['memory_request']} | CPU Limit={iter_rec_config['cpu_limit']}, Request={iter_rec_config['cpu_request']}")
 
             if sla_passed or best_five_chaos_result is None:
                 best_five_chaos_result = five_chaos_result
@@ -3242,7 +3331,8 @@ def process_application(
                     "difference_str": f"{step_entry['difference']}M",
                     "next_midpoint": step_entry["next_midpoint"],
                     "converged": step_entry["converged"],
-                    "chaos_vector": chaos_vector
+                    "chaos_vector": chaos_vector,
+                    "recommended_config": iter_rec_config
                 })
 
             if effective_mode == "heuristic":
@@ -3331,11 +3421,43 @@ def process_application(
 
         multi_summary = multi_session.summary()
         safe_ram_mb = multi_session.best_passing_vector["RAM"] if (service_passed and multi_session.best_passing_vector) else (multi_session.sessions["RAM"].best_passing_value if service_passed else 0)
-        recommended_mem_limit = f"{max(64, baseline_mem_mb + int(safe_ram_mb * 1.25))}Mi"
-        recommended_mem_request = f"{max(32, baseline_mem_mb)}Mi"
+        safe_cpu_pct = multi_session.best_passing_vector["CPU"] if (service_passed and multi_session.best_passing_vector) else (multi_session.sessions["CPU"].best_passing_value if service_passed else 10)
 
-        recommended_cpu_limit = f"{max(100, int(baseline_cpu_m * 1.25))}m"
-        recommended_cpu_request = f"{max(50, baseline_cpu_m)}m"
+        passing_trials = [it for it in multi_session.history if it["passed"]]
+        if passing_trials:
+            min_passing_trial = min(
+                passing_trials,
+                key=lambda it: (
+                    (it.get("metrics") or {}).get("memory_avg")
+                    or (it.get("metrics") or {}).get("memory_max")
+                    or 999999999
+                )
+            )
+            baseline_metrics = min_passing_trial.get("metrics")
+        else:
+            baseline_metrics = best_metrics or result.get("metrics")
+
+        final_rec_config = calculate_recommended_config(
+            metrics=best_metrics or result.get("metrics"),
+            baseline_metrics=baseline_metrics
+        )
+        recommended_mem_limit = final_rec_config["memory_limit"]
+        recommended_mem_request = final_rec_config["memory_request"]
+        recommended_cpu_limit = final_rec_config["cpu_limit"]
+        recommended_cpu_request = final_rec_config["cpu_request"]
+
+        # Generate production-ready right-sized Kubernetes manifest
+        optimized_yaml_str, optimized_yaml_file = generate_optimized_deployment_yaml(
+            application=application,
+            recommended_config={
+                "memory_limit": recommended_mem_limit,
+                "memory_request": recommended_mem_request,
+                "cpu_limit": recommended_cpu_limit,
+                "cpu_request": recommended_cpu_request
+            },
+            optimal_tolerances=optimal_vals
+        )
+        print(f"\nGenerated Right-Sized Manifest: {optimized_yaml_file}")
 
         optimal_vals = multi_summary["optimal_values"]
 
@@ -3358,9 +3480,12 @@ def process_application(
             "optimal_values": optimal_vals,
             "max_safe_tolerance": optimal_vals["RAM"] if service_passed else "0M",
             "iterations": multi_session.history,
-            "summary": multi_summary
+            "summary": multi_summary,
+            "optimized_yaml": optimized_yaml_str,
+            "optimized_yaml_file": optimized_yaml_file
         }
         result["optimization"] = optimization_summary
+        result["generated_files"]["optimized_deployment"] = optimized_yaml_file
 
         print("\n========================================")
         print("MULTI-PARAMETER CONVERGENCE SUMMARY")
@@ -3389,6 +3514,8 @@ def process_application(
                 "service": name,
                 "status": "passed" if service_passed else "failed",
                 "optimization": optimization_summary,
+                "optimized_yaml": optimized_yaml_str,
+                "optimized_yaml_file": optimized_yaml_file,
                 "metrics": result.get("metrics"),
                 "stages": result.get("stages")
             })

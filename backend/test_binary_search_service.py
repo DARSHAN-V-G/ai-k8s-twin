@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(__file__))
 from services.binary_search_service import (
     calculate_bounds,
     evaluate_sla,
+    calculate_recommended_config,
     generate_heuristic_parameters,
     BinarySearchSession,
     MultiParamSearchSession
@@ -304,6 +305,39 @@ def test_multi_param_stagnation_and_frozen_culprit_termination():
     print(f"test_multi_param_stagnation_and_frozen_culprit_termination PASSED (terminated cleanly in {multi_session.iteration} iterations)")
 
 
+def test_calculate_recommended_config():
+    # 1. Real measured telemetry metrics: peak memory 28 MiB, peak cpu 117m
+    metrics = {
+        "memory_max": 28 * 1024 * 1024,
+        "memory_avg": 24 * 1024 * 1024,
+        "cpu_max": 0.117,
+        "cpu_avg": 0.050
+    }
+    rec1 = calculate_recommended_config(metrics=metrics)
+    assert rec1["memory_limit"] == "35Mi"   # int(28 * 1.25) = 35Mi
+    assert rec1["memory_request"] == "24Mi"
+    assert rec1["cpu_limit"] == "146m"      # int(117 * 1.25) = 146m
+    assert rec1["cpu_request"] == "50m"
+
+    # 2. Fallback when telemetry is absent
+    rec2 = calculate_recommended_config(metrics=None, default_mem_mb=32, default_cpu_m=50)
+    assert rec2["memory_limit"] == "40Mi"   # int(32 * 1.25) = 40Mi
+    assert rec2["memory_request"] == "26Mi" # int(32 * 0.8) = 26Mi
+    assert rec2["cpu_limit"] == "62m"       # int(50 * 1.25) = 62m
+    assert rec2["cpu_request"] == "40m"     # int(50 * 0.8) = 40m
+
+    # 3. Dual metrics: baseline request from Trial 01 (18Mi) and peak limit from Trial 02 (25Mi)
+    t1_metrics = {"memory_max": 18 * 1024 * 1024, "memory_avg": 18 * 1024 * 1024, "cpu_max": 0.025, "cpu_avg": 0.025}
+    t2_metrics = {"memory_max": 25 * 1024 * 1024, "memory_avg": 20 * 1024 * 1024, "cpu_max": 0.050, "cpu_avg": 0.035}
+    rec3 = calculate_recommended_config(metrics=t2_metrics, baseline_metrics=t1_metrics)
+    assert rec3["memory_request"] == "18Mi"  # True minimal healthy baseline
+    assert rec3["memory_limit"] == "32Mi"    # Peak chaos survived + 25% buffer (max(32, 25*1.25) = 32)
+    assert rec3["cpu_request"] == "25m"
+    assert rec3["cpu_limit"] == "62m"
+
+    print("test_calculate_recommended_config PASSED")
+
+
 if __name__ == "__main__":
     test_calculate_bounds_with_limits()
     test_calculate_bounds_without_limits()
@@ -313,6 +347,7 @@ if __name__ == "__main__":
     test_binary_search_session_no_success_searches_down_to_one()
     test_multi_param_search_session_attribution()
     test_multi_param_stagnation_and_frozen_culprit_termination()
+    test_calculate_recommended_config()
     print("\nALL BINARY SEARCH ENGINE TESTS PASSED!")
 
 

@@ -50,9 +50,70 @@ function App() {
   const [logFilterQuery, setLogFilterQuery] = useState('')
 
   const [autoScroll, setAutoScroll] = useState(true)
+  const [copiedServiceYaml, setCopiedServiceYaml] = useState(false)
   const isUserInspectingRef = useRef(false)
   const controllerRef = useRef(null)
   const terminalBottomRef = useRef(null)
+
+  const handleCopyYaml = (yamlText) => {
+    if (!yamlText) return
+    navigator.clipboard.writeText(yamlText)
+    setCopiedServiceYaml(true)
+    setTimeout(() => setCopiedServiceYaml(false), 2000)
+  }
+
+  const handleDownloadYaml = (serviceName, yamlText) => {
+    if (!yamlText) return
+    const blob = new Blob([yamlText], { type: 'text/yaml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${serviceName || 'service'}-optimized-deployment.yaml`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  const generateFallbackYaml = (svc) => {
+    if (!svc) return ''
+    const memLimit = svc.optimization?.recommended_config?.memory_limit || '32Mi'
+    const memReq = svc.optimization?.recommended_config?.memory_request || '18Mi'
+    const cpuLimit = svc.optimization?.recommended_config?.cpu_limit || '62m'
+    const cpuReq = svc.optimization?.recommended_config?.cpu_request || '25m'
+    return `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${svc.name}
+  namespace: ${svc.namespace || 'default'}
+  labels:
+    app: ${svc.name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${svc.name}
+  template:
+    metadata:
+      labels:
+        app: ${svc.name}
+    spec:
+      containers:
+        - name: server
+          image: ${svc.name}
+          resources:
+            requests:
+              cpu: ${cpuReq}
+              memory: ${memReq}
+            limits:
+              cpu: ${cpuLimit}
+              memory: ${memLimit}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            timeoutSeconds: 2`
+  }
 
   const addLogEntry = (serviceName, type, text) => {
     const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0)
@@ -982,6 +1043,38 @@ function App() {
                         </strong>
                         <small>During compound chaos</small>
                       </div>
+
+                      {/* Optimized Kubernetes Deployment Manifest Panel */}
+                      <div className="manifest-export-card">
+                        <div className="manifest-export-header">
+                          <div className="manifest-title-group">
+                            <span className="indicator-pip" />
+                            <span className="manifest-title">RIGHT-SIZED KUBERNETES MANIFEST</span>
+                            <span className="manifest-badge">[PRODUCTION READY]</span>
+                          </div>
+                          <div className="manifest-actions">
+                            <button
+                              type="button"
+                              className="btn-manifest-action"
+                              onClick={() => handleCopyYaml(activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService))}
+                            >
+                              {copiedServiceYaml ? '[COPIED]' : '[COPY YAML]'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-manifest-action btn-manifest-download"
+                              onClick={() => handleDownloadYaml(activeService.name, activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService))}
+                            >
+                              [DOWNLOAD YAML]
+                            </button>
+                          </div>
+                        </div>
+                        <div className="manifest-code-wrapper">
+                          <pre className="manifest-code-block">
+                            <code>{activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService)}</code>
+                          </pre>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 ) : activeService.error ? (
@@ -1015,6 +1108,12 @@ function App() {
                         const vector = iter.chaos_vector || {}
                         const culprit = iter.culprit || (!isPass && iter.parameter && iter.parameter !== 'Compound' ? iter.parameter : null)
                         const paramStates = iter.parameters_state || null
+                        const recConfig = iter.recommended_config || {
+                          memory_limit: activeService.metrics?.memory_max ? `${Math.max(32, Math.round((activeService.metrics.memory_max / (1024 * 1024)) * 1.25))}Mi` : '40Mi',
+                          memory_request: activeService.metrics?.memory_max ? `${Math.max(16, Math.round((activeService.metrics.memory_max / (1024 * 1024)) * 0.8))}Mi` : '26Mi',
+                          cpu_limit: activeService.metrics?.cpu_max ? `${Math.max(50, Math.round(activeService.metrics.cpu_max * 1000 * 1.25))}m` : '62m',
+                          cpu_request: activeService.metrics?.cpu_max ? `${Math.max(25, Math.round(activeService.metrics.cpu_max * 1000 * 0.8))}m` : '40m',
+                        }
 
                         return (
                           <div key={iter.iteration} className={`trial-card ${isPass ? 'trial-pass' : 'trial-fail'}`}>
@@ -1057,6 +1156,29 @@ function App() {
                                 <span className="vector-chip">
                                   <span className="chip-key">PARTITION</span>
                                   <code className="chip-val">{vector.partition || activeService.name}</code>
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Iteration Recommended Sizing Configuration Row */}
+                            <div className="trial-rec-config-row">
+                              <span className="rec-config-label">RECOMMENDED CONFIG:</span>
+                              <div className="rec-config-chips-group">
+                                <span className="rec-config-chip">
+                                  <span className="rec-chip-key">MEM LIMIT:</span>
+                                  <code className="rec-chip-val highlight-val">{recConfig.memory_limit}</code>
+                                </span>
+                                <span className="rec-config-chip">
+                                  <span className="rec-chip-key">MEM REQ:</span>
+                                  <code className="rec-chip-val highlight-secondary">{recConfig.memory_request}</code>
+                                </span>
+                                <span className="rec-config-chip">
+                                  <span className="rec-chip-key">CPU LIMIT:</span>
+                                  <code className="rec-chip-val highlight-val">{recConfig.cpu_limit}</code>
+                                </span>
+                                <span className="rec-config-chip">
+                                  <span className="rec-chip-key">CPU REQ:</span>
+                                  <code className="rec-chip-val highlight-secondary">{recConfig.cpu_request}</code>
                                 </span>
                               </div>
                             </div>

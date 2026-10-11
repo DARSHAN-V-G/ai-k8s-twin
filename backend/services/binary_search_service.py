@@ -67,6 +67,58 @@ def calculate_bounds(application, cluster_cpu="2", cluster_memory="4Gi"):
     return bounds
 
 
+def calculate_recommended_config(metrics=None, baseline_metrics=None, default_mem_mb=32, default_cpu_m=50, **kwargs):
+    """
+    Computes recommended Kubernetes resource limits and requests based on
+    actual observed telemetry metrics (cAdvisor / kubelet):
+    - Memory Limit: peak observed memory under chaos + 25% safety buffer (minimum 32Mi)
+    - Memory Request: average/baseline observed memory under low/normal conditions (minimum 16Mi)
+    - CPU Limit: peak observed CPU under chaos + 25% safety buffer (minimum 50m)
+    - CPU Request: average/baseline observed CPU under normal conditions (minimum 25m)
+    """
+    metrics = metrics or {}
+    base_metrics = baseline_metrics or metrics
+
+    peak_mem_bytes = metrics.get("memory_max") or metrics.get("memory_avg")
+    avg_mem_bytes = base_metrics.get("memory_avg") or base_metrics.get("memory_max")
+
+    peak_cpu_cores = metrics.get("cpu_max") or metrics.get("cpu_avg")
+    avg_cpu_cores = base_metrics.get("cpu_avg") or base_metrics.get("cpu_max")
+
+    if peak_mem_bytes:
+        peak_mem_mb = max(16, int(round(peak_mem_bytes / (1024 * 1024))))
+    else:
+        peak_mem_mb = default_mem_mb
+
+    if avg_mem_bytes:
+        avg_mem_mb = max(16, int(round(avg_mem_bytes / (1024 * 1024))))
+    else:
+        avg_mem_mb = max(16, int(round(peak_mem_mb * 0.8)))
+
+    if peak_cpu_cores:
+        peak_cpu_m = max(50, int(round(peak_cpu_cores * 1000)))
+    else:
+        peak_cpu_m = default_cpu_m
+
+    if avg_cpu_cores:
+        avg_cpu_m = max(25, int(round(avg_cpu_cores * 1000)))
+    else:
+        avg_cpu_m = max(25, int(round(peak_cpu_m * 0.8)))
+
+    mem_limit = max(32, int(round(peak_mem_mb * 1.25)))
+    mem_req = max(16, avg_mem_mb)
+
+    cpu_limit = max(50, int(round(peak_cpu_m * 1.25)))
+    cpu_req = max(25, avg_cpu_m)
+
+    return {
+        "memory_limit": f"{mem_limit}Mi",
+        "memory_request": f"{mem_req}Mi",
+        "cpu_limit": f"{cpu_limit}m",
+        "cpu_request": f"{cpu_req}m"
+    }
+
+
 def evaluate_sla(k6_result, metrics=None, max_error_rate_percent=None, max_p95_ms=None):
     """
     Evaluates whether an experiment iteration satisfied SLA criteria.
@@ -310,11 +362,14 @@ class MultiParamSearchSession:
             "LOSS": self.sessions["LOSS"].next_value() if not self.sessions["LOSS"].converged else self.sessions["LOSS"].best_passing_value,
         }
 
-    def record_trial(self, tested_vector, passed, k6_result=None, metrics=None, reason=""):
+    def record_trial(self, tested_vector, passed, k6_result=None, metrics=None, reason="", recommended_config=None):
         self.iteration += 1
         culprit = None
         trial_reason = reason
         self.tested_vectors.append(dict(tested_vector))
+
+        if recommended_config is None:
+            recommended_config = calculate_recommended_config(metrics=metrics)
 
         if passed:
             # All SLA passed: Advance lower bounds for all non-converged parameters
@@ -398,6 +453,7 @@ class MultiParamSearchSession:
             "next_midpoint": f"{next_vector['RAM']}M" if next_vector else None,
             "converged": self.converged,
             "tested_value": f"{tested_vector['RAM']}M",
+            "recommended_config": recommended_config,
             "difference": self.sessions["RAM"].high - self.sessions["RAM"].low,
             "parameters_state": {
                 name: {
