@@ -1,3 +1,17 @@
+# AI K8s Twin
+
+> Autonomous Resilience Testing, Chaos Engineering & Microservice Right-Sizing Platform for Kubernetes.
+
+Full documentation is available in the **[`docs/`](docs/README.md)** directory:
+- **[System Overview](docs/01-overview/system-overview.md)** & **[Architecture](docs/01-overview/architecture.md)**
+- **[Cluster Setup Guide](docs/02-setup-and-operations/local-cluster-setup.md)** & **[Operational Runbook](docs/02-setup-and-operations/runbook.md)**
+- **[The 7 Chaos Types](docs/03-chaos-engineering/the-seven-chaos-types.md)** & **[Compound Chaos](docs/03-chaos-engineering/compound-chaos.md)**
+- **[Binary Search Engine](docs/04-optimization-and-convergence/binary-search-engine.md)** & **[Failure Attribution](docs/04-optimization-and-convergence/failure-attribution.md)**
+- **[Right-Sizing Methodology](docs/04-optimization-and-convergence/right-sizing-methodology.md)** (Limits & Requests)
+- **[REST API Reference](docs/07-api-and-schemas/rest-api-reference.md)** & **[Dashboard UI Guide](docs/08-frontend-dashboard/user-interface-guide.md)**
+
+---
+
 ## Current Implementation
 
 The backend currently implements the environment simulation and workload generation pipeline.

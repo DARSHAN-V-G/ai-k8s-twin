@@ -33,6 +33,7 @@ function App() {
     CHAOS_ENVIRONMENTS.map(([name]) => name)
   )
   const [running, setRunning] = useState(false)
+  const [activeRunningService, setActiveRunningService] = useState(null)
   const [configCollapsed, setConfigCollapsed] = useState(false)
 
   // Service-wise state: list of services: { name, namespace, kind, status, stages: {}, optimization, metrics, error }
@@ -52,7 +53,6 @@ function App() {
   const isUserInspectingRef = useRef(false)
   const controllerRef = useRef(null)
   const terminalBottomRef = useRef(null)
-
 
   const addLogEntry = (serviceName, type, text) => {
     const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0)
@@ -85,21 +85,84 @@ function App() {
     )
   }
 
-  const runExperiment = async (e) => {
-    e.preventDefault()
-    if (running) return
+  const stopExperiment = async () => {
+    addLogEntry(null, 'command', '$ POST /api/environment-orchestrator/stop')
+    try {
+      await fetch('/api/environment-orchestrator/stop', { method: 'POST' })
+    } catch (e) {
+      console.error('Stop request error:', e)
+    }
+    if (controllerRef.current) {
+      controllerRef.current.abort()
+      controllerRef.current = null
+    }
+    setRunning(false)
+    setActiveRunningService(null)
+    setServices((prev) =>
+      prev.map((s) => (s.status === 'running' ? { ...s, status: 'waiting' } : s))
+    )
+  }
+
+  const executeOrchestrator = async (targetService = null) => {
+    // If an execution is running, abort it cleanly first
+    if (running || controllerRef.current) {
+      await stopExperiment()
+      await new Promise((r) => setTimeout(r, 120))
+    }
 
     setRunning(true)
     setConfigCollapsed(true)
-    setServices([])
-    setSelectedServiceName(null)
-    setGlobalLogs([])
-    setServiceLogs({})
-    setActiveLogTab('service')
-    isUserInspectingRef.current = false
+    setActiveRunningService(targetService && targetService !== 'discovery_only' ? targetService : null)
+
+    if (targetService && targetService !== 'discovery_only') {
+      // Running a specific service: mark only this service as running
+      setServices((prev) =>
+        prev.map((s) =>
+          s.name === targetService
+            ? {
+                ...s,
+                status: 'running',
+                iterations: [],
+                optimization: null,
+                stages: {
+                  deploy: 'pending',
+                  pod_kill: 'pending',
+                  five_chaos: 'pending',
+                  node_failure: 'pending',
+                },
+                error: null,
+              }
+            : s
+        )
+      )
+      setSelectedServiceName(targetService)
+      isUserInspectingRef.current = true
+    } else if (!targetService) {
+      // Running all: reset all services to waiting
+      setServices((prev) =>
+        prev.map((s) => ({
+          ...s,
+          status: 'waiting',
+          iterations: [],
+          optimization: null,
+          stages: {
+            deploy: 'pending',
+            pod_kill: 'pending',
+            five_chaos: 'pending',
+            node_failure: 'pending',
+          },
+          error: null,
+        }))
+      )
+    }
 
     controllerRef.current = new AbortController()
-    addLogEntry(null, 'command', '$ POST /api/environment-orchestrator/run')
+    const logTag = targetService === 'discovery_only'
+      ? '$ POST /api/environment-orchestrator/run [mode=discovery_only]'
+      : targetService
+      ? `$ POST /api/environment-orchestrator/run [target_service=${targetService}]`
+      : '$ POST /api/environment-orchestrator/run [all_workloads]'
+    addLogEntry(targetService, 'command', logTag)
 
     try {
       const response = await fetch('/api/environment-orchestrator/run', {
@@ -108,6 +171,7 @@ function App() {
         body: JSON.stringify({
           ...form,
           environments: selectedEnvironments,
+          ...(targetService ? { target_service: targetService } : {}),
         }),
         signal: controllerRef.current.signal,
       })
@@ -141,13 +205,12 @@ function App() {
             return
           }
 
-          // Handle typed SSE events
           if (event === 'discovery') {
             const discovered = (payload.services || []).map((s) => ({
               name: s.name,
               namespace: s.namespace || 'default',
               kind: s.kind || 'Deployment',
-              status: 'waiting',
+              status: s.name === targetService ? 'running' : 'waiting',
               stages: {
                 deploy: 'pending',
                 pod_kill: 'pending',
@@ -157,11 +220,22 @@ function App() {
               optimization: null,
               metrics: null,
               error: null,
+              iterations: [],
             }))
-            setServices(discovered)
-            if (discovered.length > 0) {
-              setSelectedServiceName(discovered[0].name)
-            }
+
+            setServices((prev) => {
+              if (prev.length === 0) return discovered
+              return discovered.map((d) => {
+                const existing = prev.find((p) => p.name === d.name)
+                if (!existing) return d
+                if (d.name === targetService) {
+                  return { ...existing, status: 'running', error: null }
+                }
+                return existing
+              })
+            })
+
+            setSelectedServiceName((prev) => prev || discovered[0]?.name || null)
             addLogEntry(
               null,
               'success',
@@ -169,17 +243,17 @@ function App() {
             )
           } else if (event === 'service_start') {
             const svcName = payload.service
+            setActiveRunningService(svcName)
             setServices((prev) =>
               prev.map((s) => (s.name === svcName ? { ...s, status: 'running' } : s))
             )
-            // Only auto-switch selected service if user is not actively inspecting another service
             if (!isUserInspectingRef.current) {
               setSelectedServiceName(svcName)
             }
             addLogEntry(
               svcName,
               'command',
-              `▶ Starting resilience simulation for ${svcName} (${payload.index}/${payload.total})`
+              `[START] Resilience simulation for ${svcName} (${payload.index}/${payload.total})`
             )
           } else if (event === 'stage_update') {
             const { service: svcName, stage, status } = payload
@@ -213,7 +287,7 @@ function App() {
             addLogEntry(
               svcName,
               payload.sla_passed ? 'success' : 'error',
-              `[Iter ${payload.iteration}/${payload.max_iterations}] ${payload.parameter} @ ${payload.tested_value} ➔ ${
+              `[TRIAL ${payload.iteration}/${payload.max_iterations}] ${payload.parameter} @ ${payload.tested_value} -> ${
                 payload.sla_passed ? 'PASSED' : 'BREACHED'
               } | ${payload.step_taken}`
             )
@@ -248,17 +322,17 @@ function App() {
               svcName,
               isPassed ? 'success' : 'error',
               isPassed
-                ? `✔ Service ${svcName} completed resilience evaluation.`
-                : `✖ Service ${svcName} failed: ${payload.error || 'Execution failure'}`
+                ? `[COMPLETED] Service ${svcName} passed resilience evaluation.`
+                : `[FAILED] Service ${svcName} failed: ${payload.error || 'Execution failure'}`
             )
           } else if (event === 'aggregate_complete') {
-            addLogEntry(null, 'success', '═══════════════════════════════════════════════════════')
+            addLogEntry(null, 'success', '==================================================')
             addLogEntry(
               null,
               'success',
-              `🎉 All ${payload.total} microservices evaluated successfully.`
+              `Workload evaluation completed (${payload.total} services evaluated).`
             )
-            addLogEntry(null, 'success', '═══════════════════════════════════════════════════════')
+            addLogEntry(null, 'success', '==================================================')
           } else if (event === 'error') {
             addLogEntry(null, 'error', `Environment simulation failed: ${payload.message}`)
           }
@@ -271,13 +345,14 @@ function App() {
     } finally {
       controllerRef.current = null
       setRunning(false)
+      setActiveRunningService(null)
     }
   }
 
-  const stopExperiment = () => {
-    if (!controllerRef.current) return
-    addLogEntry(null, 'command', '$ STOP environment orchestrator')
-    controllerRef.current.abort()
+  const runExperiment = async (e) => {
+    e.preventDefault()
+    if (running) return
+    await executeOrchestrator(null)
   }
 
   // Active inspected service details
@@ -494,13 +569,24 @@ function App() {
                 disabled={running || selectedEnvironments.length === 0}
               >
                 <span>
-                  {running ? 'Resilience Simulation Running...' : 'Run Resilience Orchestrator'}
+                  {running ? 'Execution In Progress...' : 'Run All Workloads'}
                 </span>
-                <b>{running ? '⏳' : '→'}</b>
+                <b>{running ? '[BUSY]' : '->'}</b>
               </button>
+
+              <button
+                className="discover-button"
+                type="button"
+                disabled={running}
+                onClick={() => executeOrchestrator('discovery_only')}
+                title="Clone and scan manifests to discover all microservices"
+              >
+                Discover Workloads
+              </button>
+
               {running && (
                 <button className="stop-button" type="button" onClick={stopExperiment}>
-                  Stop Execution <b>×</b>
+                  Stop Execution <b>[X]</b>
                 </button>
               )}
             </div>
@@ -552,11 +638,11 @@ function App() {
 
           {services.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">☸</div>
+              <div className="empty-icon">[CLUSTER]</div>
               <h3>No Workloads Discovered Yet</h3>
               <p>
-                Start an orchestrator run above. Once the repository is cloned and manifests are
-                parsed, microservices will appear here in real-time.
+                Click <strong>"Discover Workloads"</strong> above to scan your repository manifests,
+                or launch <strong>"Run All Workloads"</strong> to discover and evaluate all microservices.
               </p>
             </div>
           ) : (
@@ -583,10 +669,37 @@ function App() {
                           {svc.kind} • {svc.namespace}
                         </span>
                       </div>
-                      <span className={`status-pill pill-${svc.status}`}>
-                        {svc.status === 'running' && <span className="spinner" />}
-                        {svc.status.toUpperCase()}
-                      </span>
+                      <div className="card-actions-group">
+                        <span className={`status-pill pill-${svc.status}`}>
+                          {svc.status === 'running' && <span className="spinner" />}
+                          {svc.status.toUpperCase()}
+                        </span>
+                        {svc.status === 'running' ? (
+                          <button
+                            type="button"
+                            className="btn-card-action btn-card-stop"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              stopExperiment()
+                            }}
+                            title={`Stop ${svc.name}`}
+                          >
+                            STOP
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-card-action btn-card-run"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              executeOrchestrator(svc.name)
+                            }}
+                            title={running ? `Stop current and run ${svc.name}` : `Run ${svc.name}`}
+                          >
+                            RUN
+                          </button>
+                        )}
+                      </div>
                     </div>
 
                     {/* Stage Pipeline Chips */}
@@ -597,12 +710,12 @@ function App() {
                           <div key={key} className={`stage-step step-${stageStatus}`} title={`${label}: ${stageStatus}`}>
                             <span className="step-dot">
                               {stageStatus === 'completed'
-                                ? '✓'
+                                ? '[OK]'
                                 : stageStatus === 'failed'
-                                ? '✕'
+                                ? '[X]'
                                 : stageStatus === 'running'
-                                ? '⏳'
-                                : '○'}
+                                ? '[..]'
+                                : '[-]'}
                             </span>
                             <span className="step-label">{label}</span>
                           </div>
@@ -615,7 +728,15 @@ function App() {
                       <div className="sizing-teaser">
                         <span className="sizing-tag">Right-Sized:</span>
                         <code>
-                          {recMem} RAM • {recCpu} CPU
+                          {recMem}
+                          {svc.optimization?.recommended_config?.memory_request
+                            ? ` / ${svc.optimization.recommended_config.memory_request}`
+                            : ''}{' '}
+                          RAM • {recCpu}
+                          {svc.optimization?.recommended_config?.cpu_request
+                            ? ` / ${svc.optimization.recommended_config.cpu_request}`
+                            : ''}{' '}
+                          CPU
                         </code>
                       </div>
                     )}
@@ -626,11 +747,15 @@ function App() {
                         <span className="iter-count-tag">
                           ITERATIONS: {(svc.iterations || svc.optimization?.iterations || []).length}
                         </span>
-                        {svc.optimization?.max_safe_tolerance && (
+                        {svc.optimization?.optimal_values ? (
+                          <span className="safe-tol-tag">
+                            SAFE: <code>RAM {svc.optimization.optimal_values.RAM} • LOSS {svc.optimization.optimal_values.LOSS}</code>
+                          </span>
+                        ) : svc.optimization?.max_safe_tolerance ? (
                           <span className="safe-tol-tag">
                             SAFE: <code>{svc.optimization.max_safe_tolerance}</code>
                           </span>
-                        )}
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -664,9 +789,49 @@ function App() {
                       <code>{activeService.kind}</code>
                     </p>
                   </div>
-                  <span className={`status-pill pill-${activeService.status}`}>
-                    {activeService.status.toUpperCase()}
-                  </span>
+                  <div className="inspector-ctrl-group">
+                    <span className={`status-pill pill-${activeService.status}`}>
+                      {activeService.status === 'running' && <span className="spinner" />}
+                      {activeService.status.toUpperCase()}
+                    </span>
+
+                    {activeService.status === 'running' ? (
+                      <button
+                        type="button"
+                        className="btn-inspector-action btn-inspector-stop"
+                        onClick={stopExperiment}
+                      >
+                        STOP SERVICE
+                      </button>
+                    ) : running && activeRunningService && activeRunningService !== activeService.name ? (
+                      <div className="switch-action-row">
+                        <button
+                          type="button"
+                          className="btn-inspector-action btn-inspector-run"
+                          onClick={() => executeOrchestrator(activeService.name)}
+                          title={`Stop ${activeRunningService} and execute ${activeService.name}`}
+                        >
+                          SWITCH &amp; RUN THIS SERVICE
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-inspector-action btn-inspector-stop-alt"
+                          onClick={stopExperiment}
+                          title={`Stop ${activeRunningService}`}
+                        >
+                          STOP {activeRunningService.toUpperCase()}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-inspector-action btn-inspector-run"
+                        onClick={() => executeOrchestrator(activeService.name)}
+                      >
+                        RUN THIS SERVICE
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {/* Resilience & Right-Sizing Insights */}
@@ -689,21 +854,116 @@ function App() {
                       </div>
                     </div>
 
+                    {/* 4-Parameter Resilience Profile Grid */}
+                    <div className="multi-param-tolerances-grid">
+                      {/* RAM */}
+                      <div className={`param-tolerance-card ${activeService.optimization.optimal_values ? 'param-converged' : ''}`}>
+                        <div className="param-card-header">
+                          <span className="param-title">RAM STRESS</span>
+                          <span className={`param-status-pill ${activeService.optimization.optimal_values ? 'pill-converged' : 'pill-active'}`}>
+                            {activeService.optimization.optimal_values ? '[CONVERGED]' : '[TUNING]'}
+                          </span>
+                        </div>
+                        <div className="param-card-value">
+                          {activeService.optimization.optimal_values?.RAM || activeService.optimization.max_safe_tolerance || 'N/A'}
+                        </div>
+                        <div className="param-card-bounds">
+                          <span className="bounds-label">Active Bounds:</span>
+                          <code>[{activeService.optimization.bounds?.['Memory Stress']?.low || 1}M, {activeService.optimization.bounds?.['Memory Stress']?.high || 128}M]</code>
+                        </div>
+                      </div>
+
+                      {/* CPU */}
+                      <div className={`param-tolerance-card ${activeService.optimization.optimal_values ? 'param-converged' : ''}`}>
+                        <div className="param-card-header">
+                          <span className="param-title">CPU SATURATION</span>
+                          <span className={`param-status-pill ${activeService.optimization.optimal_values ? 'pill-converged' : 'pill-active'}`}>
+                            {activeService.optimization.optimal_values ? '[CONVERGED]' : '[TUNING]'}
+                          </span>
+                        </div>
+                        <div className="param-card-value">
+                          {activeService.optimization.optimal_values?.CPU || '50%'}
+                        </div>
+                        <div className="param-card-bounds">
+                          <span className="bounds-label">Active Bounds:</span>
+                          <code>[{activeService.optimization.bounds?.['CPU Stress']?.low || 10}%, {activeService.optimization.bounds?.['CPU Stress']?.high || 100}%]</code>
+                        </div>
+                      </div>
+
+                      {/* DELAY */}
+                      <div className={`param-tolerance-card ${activeService.optimization.optimal_values ? 'param-converged' : ''}`}>
+                        <div className="param-card-header">
+                          <span className="param-title">NETWORK DELAY</span>
+                          <span className={`param-status-pill ${activeService.optimization.optimal_values ? 'pill-converged' : 'pill-active'}`}>
+                            {activeService.optimization.optimal_values ? '[CONVERGED]' : '[TUNING]'}
+                          </span>
+                        </div>
+                        <div className="param-card-value">
+                          {activeService.optimization.optimal_values?.DELAY || '100ms'}
+                        </div>
+                        <div className="param-card-bounds">
+                          <span className="bounds-label">Active Bounds:</span>
+                          <code>[{activeService.optimization.bounds?.['Network Delay']?.low || 10}ms, {activeService.optimization.bounds?.['Network Delay']?.high || 1500}ms]</code>
+                        </div>
+                      </div>
+
+                      {/* LOSS */}
+                      <div className={`param-tolerance-card ${activeService.optimization.optimal_values ? 'param-converged' : ''}`}>
+                        <div className="param-card-header">
+                          <span className="param-title">PACKET LOSS</span>
+                          <span className={`param-status-pill ${activeService.optimization.optimal_values ? 'pill-converged' : 'pill-active'}`}>
+                            {activeService.optimization.optimal_values ? '[CONVERGED]' : '[TUNING]'}
+                          </span>
+                        </div>
+                        <div className="param-card-value">
+                          {activeService.optimization.optimal_values?.LOSS || '3.0%'}
+                        </div>
+                        <div className="param-card-bounds">
+                          <span className="bounds-label">Active Bounds:</span>
+                          <code>[{activeService.optimization.bounds?.['Network Loss']?.low || 0.5}%, {activeService.optimization.bounds?.['Network Loss']?.high || 15.0}%]</code>
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="sizing-comparison-grid">
                       <div className="sizing-box">
-                        <span className="box-title">Recommended Memory</span>
-                        <strong className="box-value highlight-val">
-                          {activeService.optimization.recommended_config?.memory_limit || 'N/A'}
-                        </strong>
-                        <small>Auto-calculated +25% buffer</small>
+                        <span className="box-title">Memory Allocation</span>
+                        <div className="sizing-dual-values">
+                          <div className="sizing-val-item">
+                            <span className="sub-tag">LIMIT:</span>
+                            <strong className="box-value highlight-val">
+                              {activeService.optimization.recommended_config?.memory_limit || 'N/A'}
+                            </strong>
+                          </div>
+                          <div className="sizing-val-item">
+                            <span className="sub-tag">REQUEST:</span>
+                            <strong className="box-value highlight-secondary">
+                              {activeService.optimization.recommended_config?.memory_request || 'N/A'}
+                            </strong>
+                          </div>
+                        </div>
+                        <small>Limit: +25% buffer • Request: baseline</small>
                       </div>
+
                       <div className="sizing-box">
-                        <span className="box-title">Recommended CPU</span>
-                        <strong className="box-value highlight-val">
-                          {activeService.optimization.recommended_config?.cpu_limit || 'N/A'}
-                        </strong>
-                        <small>Auto-calculated +25% buffer</small>
+                        <span className="box-title">CPU Allocation</span>
+                        <div className="sizing-dual-values">
+                          <div className="sizing-val-item">
+                            <span className="sub-tag">LIMIT:</span>
+                            <strong className="box-value highlight-val">
+                              {activeService.optimization.recommended_config?.cpu_limit || 'N/A'}
+                            </strong>
+                          </div>
+                          <div className="sizing-val-item">
+                            <span className="sub-tag">REQUEST:</span>
+                            <strong className="box-value highlight-secondary">
+                              {activeService.optimization.recommended_config?.cpu_request || 'N/A'}
+                            </strong>
+                          </div>
+                        </div>
+                        <small>Limit: +25% buffer • Request: baseline</small>
                       </div>
+
                       <div className="sizing-box">
                         <span className="box-title">Max Memory Observed</span>
                         <strong className="box-value">
@@ -753,6 +1013,8 @@ function App() {
                         const isPass = iter.sla_passed ?? iter.passed
                         const diffVal = iter.difference !== undefined ? iter.difference : (iter.new_bounds ? Math.abs(parseInt(iter.new_bounds[1]) - parseInt(iter.new_bounds[0])) : null)
                         const vector = iter.chaos_vector || {}
+                        const culprit = iter.culprit || (!isPass && iter.parameter && iter.parameter !== 'Compound' ? iter.parameter : null)
+                        const paramStates = iter.parameters_state || null
 
                         return (
                           <div key={iter.iteration} className={`trial-card ${isPass ? 'trial-pass' : 'trial-fail'}`}>
@@ -761,7 +1023,7 @@ function App() {
                               <div className="trial-meta-left">
                                 <span className="trial-index-tag">TRIAL {String(iter.iteration).padStart(2, '0')}</span>
                                 <span className={`trial-status-badge ${isPass ? 'status-pass' : 'status-fail'}`}>
-                                  {isPass ? 'PASSED' : 'BREACHED'}
+                                  {isPass ? '[PASS]' : `[BREACH: ${culprit || 'SLA'}]`}
                                 </span>
                                 {iter.reason && <span className="trial-reason-text">{iter.reason}</span>}
                               </div>
@@ -776,21 +1038,21 @@ function App() {
                             <div className="trial-vector-row">
                               <span className="vector-label">APPLIED 5-CHAOS:</span>
                               <div className="vector-chips-group">
-                                <span className="vector-chip chip-highlight" title="Target Stress Parameter">
+                                <span className={`vector-chip ${culprit === 'RAM' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">RAM</span>
-                                  <code className="chip-val">{vector.memory || iter.tested_value || iter.display}</code>
+                                  <code className="chip-val">{vector.memory || (iter.vector?.RAM ? `${iter.vector.RAM}M` : iter.tested_value || iter.display)}</code>
                                 </span>
-                                <span className="vector-chip">
+                                <span className={`vector-chip ${culprit === 'CPU' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">CPU</span>
-                                  <code className="chip-val">{vector.cpu || '60%'}</code>
+                                  <code className="chip-val">{vector.cpu || (iter.vector?.CPU ? `${iter.vector.CPU}%` : '60%')}</code>
                                 </span>
-                                <span className="vector-chip">
+                                <span className={`vector-chip ${culprit === 'DELAY' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">DELAY</span>
-                                  <code className="chip-val">{vector.delay || '100ms'}</code>
+                                  <code className="chip-val">{vector.delay || (iter.vector?.DELAY ? `${iter.vector.DELAY}ms` : '100ms')}</code>
                                 </span>
-                                <span className="vector-chip">
+                                <span className={`vector-chip ${culprit === 'LOSS' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">LOSS</span>
-                                  <code className="chip-val">{vector.loss || '3%'}</code>
+                                  <code className="chip-val">{vector.loss || (iter.vector?.LOSS ? `${iter.vector.LOSS}%` : '3%')}</code>
                                 </span>
                                 <span className="vector-chip">
                                   <span className="chip-key">PARTITION</span>
@@ -798,6 +1060,25 @@ function App() {
                                 </span>
                               </div>
                             </div>
+
+                            {/* Parameter Bounds State Row (if available) */}
+                            {paramStates && (
+                              <div className="trial-param-bounds-row">
+                                <span className="bounds-row-label">BOUNDS:</span>
+                                <span className={`param-bound-chip ${culprit === 'RAM' ? 'is-culprit' : ''}`}>
+                                  RAM: <code>[{paramStates.RAM.low}M, {paramStates.RAM.high}M]</code>
+                                </span>
+                                <span className={`param-bound-chip ${culprit === 'CPU' ? 'is-culprit' : ''}`}>
+                                  CPU: <code>[{paramStates.CPU.low}%, {paramStates.CPU.high}%]</code>
+                                </span>
+                                <span className={`param-bound-chip ${culprit === 'DELAY' ? 'is-culprit' : ''}`}>
+                                  DELAY: <code>[{paramStates.DELAY.low}ms, {paramStates.DELAY.high}ms]</code>
+                                </span>
+                                <span className={`param-bound-chip ${culprit === 'LOSS' ? 'is-culprit' : ''}`}>
+                                  LOSS: <code>[{paramStates.LOSS.low}%, {paramStates.LOSS.high}%]</code>
+                                </span>
+                              </div>
+                            )}
 
                             {/* Bottom: Decision Step & Bounds */}
                             <div className="trial-card-bottom">
@@ -882,7 +1163,7 @@ function App() {
                             {entry.type === 'command'
                               ? '$'
                               : entry.type === 'success'
-                              ? '✓'
+                              ? '[OK]'
                               : entry.type === 'error'
                               ? '!'
                               : '>'}

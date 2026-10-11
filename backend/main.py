@@ -6,7 +6,7 @@ import json
 import queue
 import threading
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,16 +50,37 @@ class EnvironmentRunRequest(BaseModel):
     duration: str = Field(min_length=1)
     environments: List[str] = Field(min_length=1)
     mode: str = "binary_search"
+    target_service: Optional[str] = None
+
+
+active_execution = {
+    "emitter": None
+}
 
 
 def _sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+@app.post("/api/environment-orchestrator/stop")
+async def stop_environment_orchestrator():
+    emitter = active_execution.get("emitter")
+    if emitter:
+        emitter.is_stopped = True
+        emitter.emit("service_log", {
+            "service": getattr(emitter, "active_service", None),
+            "text": "Execution stopped by user request."
+        })
+        return {"status": "stopping", "message": "Stop signal sent to orchestrator."}
+    return {"status": "idle", "message": "No active execution running."}
+
+
 @app.post("/api/environment-orchestrator/run")
 async def start_environment_orchestrator(request: EnvironmentRunRequest):
     events = queue.Queue()
     emitter = EventEmitter(events)
+    emitter.is_stopped = False
+    active_execution["emitter"] = emitter
     output = QueueLogWriter(emitter)
     sentinel = object()
 
@@ -75,6 +96,7 @@ async def start_environment_orchestrator(request: EnvironmentRunRequest):
         except Exception as error:
             emitter.emit("error", {"status": "failed", "message": str(error)})
         finally:
+            active_execution["emitter"] = None
             events.put(sentinel)
 
     threading.Thread(target=execute, daemon=True).start()

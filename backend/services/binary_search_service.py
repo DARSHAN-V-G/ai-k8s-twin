@@ -39,10 +39,10 @@ def calculate_bounds(application, cluster_cpu="2", cluster_memory="4Gi"):
 
     bounds = {
         "Memory Stress": {
-            "low": 16,
+            "low": 1,
             "high": max_mem_mb,
             "unit": "M",
-            "threshold": 16  # Stop search when difference (high - low) <= 16M
+            "threshold": 16  # Stop search when difference <= 16M (or <= 1M if no trial has passed)
         },
         "CPU Stress": {
             "low": 10,
@@ -52,15 +52,15 @@ def calculate_bounds(application, cluster_cpu="2", cluster_memory="4Gi"):
         },
         "Network Delay": {
             "low": 10,
-            "high": 2000,
+            "high": 1500,
             "unit": "ms",
             "threshold": 25  # Stop search when within 25ms
         },
         "Network Loss": {
-            "low": 1,
-            "high": 20,
-            "unit": "",
-            "threshold": 1   # Stop search when within 1%
+            "low": 0.5,
+            "high": 15.0,
+            "unit": "%",
+            "threshold": 0.5  # Stop search when within 0.5%
         }
     }
 
@@ -155,21 +155,30 @@ class BinarySearchSession:
     """
     Manages state across binary search iterations for a target stress parameter.
     """
-    def __init__(self, parameter_name, low, high, unit="", threshold=16, max_iterations=8):
+    def __init__(self, parameter_name, low=1, high=128, unit="", threshold=16, max_iterations=10, is_float=False):
         self.parameter_name = parameter_name
-        self.low = low
-        self.high = high
+        self.is_float = is_float
+        self.low = float(low) if is_float else int(low)
+        self.high = float(high) if is_float else int(high)
         self.unit = unit
-        self.threshold = threshold
+        self.threshold = float(threshold) if is_float else int(threshold)
         self.max_iterations = max_iterations
         self.iteration = 0
-        self.best_passing_value = low
+        self.has_passed = False
+        self.best_passing_value = float(low) if is_float else int(low)
         self.history = []
         self.converged = False
 
     def next_value(self):
         """Calculates midpoint value for the next trial."""
+        if self.is_float:
+            mid = round((self.low + self.high) / 2.0, 1)
+            if mid == self.low and self.low < self.high:
+                mid = round(self.low + 0.1, 1)
+            return mid
         mid = (self.low + self.high) // 2
+        if mid == self.low and self.low < self.high:
+            mid = self.low + 1
         return mid
 
     def record_result(self, tested_value, passed, reason="", chaos_vector=None):
@@ -179,6 +188,7 @@ class BinarySearchSession:
         prev_high = self.high
 
         if passed:
+            self.has_passed = True
             self.best_passing_value = tested_value
             # App survived; push higher to find breaking point
             self.low = tested_value
@@ -188,11 +198,12 @@ class BinarySearchSession:
             self.high = tested_value
             step_taken = f"Contracted Upper Bound: [{prev_low}{self.unit}, {prev_high}{self.unit}] → [{self.low}{self.unit}, {self.high}{self.unit}] (Backed off stress)"
 
-        diff = self.high - self.low
-        if diff <= self.threshold or self.iteration >= self.max_iterations:
+        diff = round(self.high - self.low, 1) if self.is_float else (self.high - self.low)
+        effective_threshold = self.threshold if self.has_passed else (0.5 if self.is_float else 1)
+        if diff <= effective_threshold or self.iteration >= self.max_iterations:
             self.converged = True
 
-        next_mid = ((self.low + self.high) // 2) if not self.converged else None
+        next_mid = self.next_value() if not self.converged else None
 
         entry = {
             "iteration": self.iteration,
@@ -209,6 +220,7 @@ class BinarySearchSession:
             "step_taken": step_taken,
             "next_midpoint": f"{next_mid}{self.unit}" if next_mid is not None else None,
             "converged": self.converged,
+            "has_passed": self.has_passed,
             "chaos_vector": chaos_vector or {}
         }
         self.history.append(entry)
@@ -222,5 +234,207 @@ class BinarySearchSession:
             "converged": self.converged,
             "breaking_point_threshold": f"{self.high}{self.unit}",
             "max_safe_tolerance": f"{self.best_passing_value}{self.unit}",
+            "history": self.history
+        }
+
+
+def attribute_failure_cause(k6_result, metrics=None, max_error_rate_percent=1.0, max_p95_ms=1000.0):
+    """
+    Identifies which of the 4 chaos parameters triggered an SLA breach:
+    - OOMKilled -> RAM
+    - Error rate exceeded -> LOSS
+    - P95 latency exceeded -> DELAY
+    - CPU throttling / saturation -> CPU
+    """
+    if metrics and metrics.get("oom_killed"):
+        return "RAM", "Container crashed with OOMKilled."
+
+    if not k6_result or k6_result.get("status") == "failed":
+        reason = k6_result.get("reason", "k6 test execution failed.") if k6_result else "No k6 telemetry."
+        reason_low = str(reason).lower()
+        if "timeout" in reason_low or "deadline" in reason_low:
+            return "DELAY", f"Latency timeout failure: {reason}"
+        return "LOSS", f"Request execution failure: {reason}"
+
+    error_rate = k6_result.get("error_rate_percent", 0.0)
+    p95_latency = k6_result.get("p95_ms", 0.0)
+
+    if error_rate > max_error_rate_percent:
+        return "LOSS", f"Error rate {error_rate:.2f}% breached threshold ({max_error_rate_percent}%)."
+
+    if p95_latency > max_p95_ms:
+        return "DELAY", f"P95 latency {p95_latency:.1f}ms breached threshold ({max_p95_ms}ms)."
+
+    if metrics and metrics.get("cpu_throttled"):
+        return "CPU", "Severe CPU throttling detected."
+
+    return "RAM", "General performance degradation."
+
+
+class MultiParamSearchSession:
+    """
+    Manages active bounds, binary search sessions, and failure attribution across all 4 parameters:
+    RAM, CPU, DELAY, and LOSS.
+    """
+    def __init__(self, bounds, max_iterations=10):
+        self.bounds = bounds
+        self.max_iterations = max_iterations
+        self.iteration = 0
+        self.history = []
+        self.tested_vectors = []
+        self.best_passing_vector = None
+        self._converged_forced = False
+
+        ram_cfg = bounds.get("Memory Stress", {"low": 1, "high": 128, "unit": "M", "threshold": 16})
+        cpu_cfg = bounds.get("CPU Stress", {"low": 10, "high": 100, "unit": "%", "threshold": 5})
+        delay_cfg = bounds.get("Network Delay", {"low": 10, "high": 1500, "unit": "ms", "threshold": 25})
+        loss_cfg = bounds.get("Network Loss", {"low": 0.5, "high": 15.0, "unit": "%", "threshold": 0.5})
+
+        self.sessions = {
+            "RAM": BinarySearchSession("RAM", low=ram_cfg.get("low", 1), high=ram_cfg["high"], unit=ram_cfg.get("unit", "M"), threshold=ram_cfg.get("threshold", 16), max_iterations=max_iterations, is_float=False),
+            "CPU": BinarySearchSession("CPU", low=cpu_cfg.get("low", 10), high=cpu_cfg["high"], unit=cpu_cfg.get("unit", "%"), threshold=cpu_cfg.get("threshold", 5), max_iterations=max_iterations, is_float=False),
+            "DELAY": BinarySearchSession("DELAY", low=delay_cfg.get("low", 10), high=delay_cfg["high"], unit=delay_cfg.get("unit", "ms"), threshold=delay_cfg.get("threshold", 25), max_iterations=max_iterations, is_float=False),
+            "LOSS": BinarySearchSession("LOSS", low=loss_cfg.get("low", 0.5), high=loss_cfg["high"], unit=loss_cfg.get("unit", "%"), threshold=loss_cfg.get("threshold", 0.5), max_iterations=max_iterations, is_float=True),
+        }
+
+    @property
+    def converged(self):
+        return self._converged_forced or all(s.converged for s in self.sessions.values()) or self.iteration >= self.max_iterations
+
+    def next_vector(self):
+        """Returns the midpoint values for all 4 parameters for the next trial."""
+        return {
+            "RAM": self.sessions["RAM"].next_value() if not self.sessions["RAM"].converged else self.sessions["RAM"].best_passing_value,
+            "CPU": self.sessions["CPU"].next_value() if not self.sessions["CPU"].converged else self.sessions["CPU"].best_passing_value,
+            "DELAY": self.sessions["DELAY"].next_value() if not self.sessions["DELAY"].converged else self.sessions["DELAY"].best_passing_value,
+            "LOSS": self.sessions["LOSS"].next_value() if not self.sessions["LOSS"].converged else self.sessions["LOSS"].best_passing_value,
+        }
+
+    def record_trial(self, tested_vector, passed, k6_result=None, metrics=None, reason=""):
+        self.iteration += 1
+        culprit = None
+        trial_reason = reason
+        self.tested_vectors.append(dict(tested_vector))
+
+        if passed:
+            # All SLA passed: Advance lower bounds for all non-converged parameters
+            self.best_passing_vector = dict(tested_vector)
+            step_parts = []
+            for name, sess in self.sessions.items():
+                if not sess.converged:
+                    sess.has_passed = True
+                    sess.best_passing_value = tested_vector[name]
+                    prev_low = sess.low
+                    sess.low = tested_vector[name]
+                    diff = round(sess.high - sess.low, 1) if sess.is_float else (sess.high - sess.low)
+                    if diff <= sess.threshold:
+                        sess.converged = True
+                    step_parts.append(f"{name}: [{prev_low}{sess.unit} -> {sess.low}{sess.unit}]")
+            step_taken = "Passed SLA. Advanced limits: " + (", ".join(step_parts) if step_parts else "All limits converged.")
+            if not trial_reason:
+                trial_reason = "SLA satisfied across all tested stress dimensions."
+        else:
+            # Breached SLA: identify culprit and check if culprit is already at safe floor
+            culprit, breach_reason = attribute_failure_cause(k6_result, metrics)
+            if not trial_reason:
+                trial_reason = breach_reason
+
+            sess = self.sessions[culprit]
+            is_culprit_frozen = (sess.high <= sess.low) or (sess.converged and tested_vector[culprit] <= sess.best_passing_value)
+
+            if is_culprit_frozen:
+                # The blamed parameter is already at its verified safe limit.
+                # The failure was provoked by other elevated non-converged stressors (e.g. CPU or Delay).
+                elevated_adjusted = []
+                for name, other_sess in self.sessions.items():
+                    if name != culprit and not other_sess.converged and tested_vector[name] > other_sess.low:
+                        other_sess.high = tested_vector[name]
+                        diff_other = round(other_sess.high - other_sess.low, 1) if other_sess.is_float else (other_sess.high - other_sess.low)
+                        effective_thresh = other_sess.threshold if other_sess.has_passed else (0.5 if other_sess.is_float else 1)
+                        if diff_other <= effective_thresh or other_sess.high <= other_sess.low:
+                            other_sess.converged = True
+                        elevated_adjusted.append(f"{name}: [{other_sess.low}{other_sess.unit}, {other_sess.high}{other_sess.unit}]")
+
+                if not elevated_adjusted:
+                    # No parameter can make further progress; terminate search immediately
+                    self._converged_forced = True
+                    step_taken = f"Converged: {culprit} reached safe floor ({sess.low}{sess.unit}). Compound stress frontier reached."
+                else:
+                    step_taken = f"{culprit} is at safe floor ({sess.low}{sess.unit}). Backed off elevated compound stressors: {', '.join(elevated_adjusted)}."
+            else:
+                prev_high = sess.high
+                sess.high = tested_vector[culprit]
+                diff = round(sess.high - sess.low, 1) if sess.is_float else (sess.high - sess.low)
+                effective_threshold = sess.threshold if sess.has_passed else (0.5 if sess.is_float else 1)
+                if diff <= effective_threshold or sess.high <= sess.low:
+                    sess.converged = True
+                step_taken = f"Contracted {culprit} Upper Bound: [{sess.low}{sess.unit}, {prev_high}{sess.unit}] → [{sess.low}{sess.unit}, {sess.high}{sess.unit}] ({breach_reason}). Other dimensions held steady."
+
+        # Vector Stagnation & Fixed-Point Detector
+        next_vector = self.next_vector() if not self.converged else None
+        if next_vector is not None:
+            if next_vector == tested_vector or next_vector in self.tested_vectors:
+                self._converged_forced = True
+                next_vector = None
+                step_taken += " Reached fixed-point boundary (no further unique vectors). Converged."
+
+        vector_display = {
+            "memory": f"{tested_vector['RAM']}M",
+            "cpu": f"{tested_vector['CPU']}%",
+            "delay": f"{tested_vector['DELAY']}ms",
+            "loss": f"{tested_vector['LOSS']}%"
+        }
+
+        entry = {
+            "iteration": self.iteration,
+            "vector": tested_vector,
+            "chaos_vector": vector_display,
+            "passed": passed,
+            "sla_passed": passed,
+            "culprit": culprit,
+            "reason": trial_reason,
+            "step_taken": step_taken,
+            "next_vector": next_vector,
+            "next_midpoint": f"{next_vector['RAM']}M" if next_vector else None,
+            "converged": self.converged,
+            "tested_value": f"{tested_vector['RAM']}M",
+            "difference": self.sessions["RAM"].high - self.sessions["RAM"].low,
+            "parameters_state": {
+                name: {
+                    "low": s.low,
+                    "high": s.high,
+                    "unit": s.unit,
+                    "diff": round(s.high - s.low, 1) if s.is_float else (s.high - s.low),
+                    "converged": s.converged,
+                    "best_safe": s.best_passing_value
+                }
+                for name, s in self.sessions.items()
+            }
+        }
+        self.history.append(entry)
+        return entry
+
+    def summary(self):
+        optimal_vals = {
+            "RAM": f"{self.sessions['RAM'].best_passing_value}{self.sessions['RAM'].unit}",
+            "CPU": f"{self.sessions['CPU'].best_passing_value}{self.sessions['CPU'].unit}",
+            "DELAY": f"{self.sessions['DELAY'].best_passing_value}{self.sessions['DELAY'].unit}",
+            "LOSS": f"{self.sessions['LOSS'].best_passing_value}{self.sessions['LOSS'].unit}"
+        }
+        if self.best_passing_vector:
+            optimal_vals = {
+                "RAM": f"{self.best_passing_vector['RAM']}{self.sessions['RAM'].unit}",
+                "CPU": f"{self.best_passing_vector['CPU']}{self.sessions['CPU'].unit}",
+                "DELAY": f"{self.best_passing_vector['DELAY']}{self.sessions['DELAY'].unit}",
+                "LOSS": f"{self.best_passing_vector['LOSS']}{self.sessions['LOSS'].unit}"
+            }
+        return {
+            "iterations_run": self.iteration,
+            "converged": self.converged,
+            "optimal_values": optimal_vals,
+            "best_passing_vector": self.best_passing_vector,
+            "parameters": {
+                name: s.summary() for name, s in self.sessions.items()
+            },
             "history": self.history
         }

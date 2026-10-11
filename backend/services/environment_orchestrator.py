@@ -12,7 +12,8 @@ from services.binary_search_service import (
     generate_heuristic_parameters,
     calculate_bounds,
     evaluate_sla,
-    BinarySearchSession
+    BinarySearchSession,
+    MultiParamSearchSession
 )
 from jinja2 import Environment, FileSystemLoader
 from dotenv import load_dotenv
@@ -1278,7 +1279,8 @@ def build_chaos_parameters(
     application,
     environments,
     parameters,
-    duration
+    duration,
+    iteration=None
 ):
 
     namespace = application.get(
@@ -1297,6 +1299,7 @@ def build_chaos_parameters(
     ).strip("-")
 
     chaos_parameters = {}
+    iter_suffix = f"-iter{iteration}" if iteration is not None else ""
 
     for environment in environments:
 
@@ -1315,6 +1318,7 @@ def build_chaos_parameters(
                 + environment
                 .lower()
                 .replace(" ", "-")
+                + iter_suffix
                 + "-experiment"
             ),
             "namespace": namespace,
@@ -1388,7 +1392,7 @@ def build_chaos_parameters(
                 environment
             ][
                 "target_app"
-            ] = target_app
+            ] = "recommendationservice" if target_app == "frontend" else target_app
 
         elif environment == "Pod Kill":
 
@@ -2465,12 +2469,26 @@ def apply_chaos_file(
 
 def cleanup_chaos(
     namespace,
-    resource_types
+    resource_types,
+    yaml_file=None
 ):
 
     print(
         "\nCleaning up Chaos Mesh resources..."
     )
+
+    if yaml_file and os.path.exists(yaml_file):
+        try:
+            run_command([
+                "kubectl",
+                "delete",
+                "-f",
+                yaml_file,
+                "--ignore-not-found",
+                "--timeout=15s"
+            ])
+        except Exception as error:
+            print(f"Cleanup yaml warning: {error}")
 
     for resource_type in resource_types:
 
@@ -2484,7 +2502,7 @@ def cleanup_chaos(
                 "-n",
                 namespace,
                 "--ignore-not-found",
-                "--wait=false"
+                "--timeout=15s"
             ])
 
         except RuntimeError as error:
@@ -2668,7 +2686,8 @@ def execute_five_chaos(
     application,
     yaml_file,
     duration,
-    vus
+    vus,
+    active_environments=None
 ):
 
     namespace = application.get(
@@ -2676,40 +2695,25 @@ def execute_five_chaos(
         "default"
     )
 
+    envs_to_run = active_environments or FIVE_CHAOS_ENVIRONMENTS
+
     print(
         "\n========================================"
     )
 
     print(
-        "STAGE 2: FIVE CHAOS ENVIRONMENTS"
+        f"STAGE 2: COMPOUND CHAOS ({len(envs_to_run)} ENVIRONMENTS)"
     )
 
     print(
         "========================================"
     )
 
-    print(
-        "\nCPU Stress"
-    )
+    for env in envs_to_run:
+        print(f"- {env}")
 
     print(
-        "Memory Stress"
-    )
-
-    print(
-        "Network Delay"
-    )
-
-    print(
-        "Network Loss"
-    )
-
-    print(
-        "Network Partition"
-    )
-
-    print(
-        "\nAll five environments will be "
+        "\nAll selected environments will be "
         "applied together."
     )
 
@@ -2747,7 +2751,7 @@ def execute_five_chaos(
     )
 
     print(
-        f"\nFive chaos environments running "
+        f"\nCompound chaos environments running "
         f"simultaneously for {duration}..."
     )
 
@@ -2756,7 +2760,7 @@ def execute_five_chaos(
     )
 
     print(
-        "\nFive-chaos duration completed."
+        "\nCompound chaos duration completed."
     )
 
     cleanup_chaos(
@@ -2764,7 +2768,8 @@ def execute_five_chaos(
         [
             "stresschaos",
             "networkchaos"
-        ]
+        ],
+        yaml_file=yaml_file
     )
 
     recovered = (
@@ -2776,7 +2781,7 @@ def execute_five_chaos(
     recovery_time = time.time() - start_time
 
     return {
-        "environments": FIVE_CHAOS_ENVIRONMENTS,
+        "environments": envs_to_run,
         "start_time": start_time,
         "end_time": time.time(),
         "duration": duration,
@@ -3101,50 +3106,63 @@ def process_application(
         # --------------------------------
         effective_mode = mode if mode in ["binary_search", "heuristic"] else "binary_search"
         bounds = calculate_bounds(application, cpu, memory)
-        mem_bounds = bounds.get("Memory Stress", {"low": 16, "high": 128, "unit": "M", "threshold": 16})
+        # --------------------------------
+        # Multi-Parameter Optimization Engine (Stage 2)
+        # --------------------------------
+        effective_mode = mode if mode in ["binary_search", "heuristic"] else "binary_search"
+        bounds = calculate_bounds(application, cpu, memory)
+        max_iters = 10 if effective_mode == "binary_search" else 1
 
-        session = BinarySearchSession(
-            parameter_name="Memory Stress",
-            low=mem_bounds["low"],
-            high=mem_bounds["high"],
-            unit=mem_bounds.get("unit", "M"),
-            threshold=mem_bounds.get("threshold", 16),
-            max_iterations=8 if effective_mode == "binary_search" else 1
-        )
+        multi_session = MultiParamSearchSession(bounds=bounds, max_iterations=max_iters)
 
         best_five_chaos_result = None
         best_metrics = None
         last_five_chaos_file = None
 
         print(f"\n========================================")
-        print(f"RESILIENCE & OPTIMIZATION LOOP ({name})")
-        print(f"Mode: {effective_mode} | Convergence Rule: (High - Low) <= {session.threshold}{session.unit}")
-        print(f"Search Bounds: [{session.low}{session.unit}, {session.high}{session.unit}]")
+        print(f"RESILIENCE & MULTI-PARAM OPTIMIZATION LOOP ({name})")
+        print(f"Mode: {effective_mode} | Testing 4 Dimensions: RAM, CPU, DELAY, LOSS")
+        print(f"Bounds: RAM [{bounds['Memory Stress']['low']}M, {bounds['Memory Stress']['high']}M] | CPU [{bounds['CPU Stress']['low']}%, {bounds['CPU Stress']['high']}%] | DELAY [{bounds['Network Delay']['low']}ms, {bounds['Network Delay']['high']}ms] | LOSS [{bounds['Network Loss']['low']}%, {bounds['Network Loss']['high']}%]")
         print(f"========================================")
 
-        while not session.converged and session.iteration < session.max_iterations:
-            current_mid = session.next_value()
-            current_iter = session.iteration + 1
-            print(f"\n--- [Iteration {current_iter}] Testing Memory Stress: {current_mid}{session.unit} (Bounds: [{session.low}{session.unit}, {session.high}{session.unit}], Diff: {session.high - session.low}{session.unit}) ---")
+        while not multi_session.converged and multi_session.iteration < multi_session.max_iterations:
+            if event_emitter and getattr(event_emitter, 'is_stopped', False):
+                print(f"\nExecution stopped by user request for {name}.")
+                break
+
+            current_vector = multi_session.next_vector()
+            current_iter = multi_session.iteration + 1
+            print(f"\n--- [Iteration {current_iter}] Testing Compound Vector: RAM {current_vector['RAM']}M | CPU {current_vector['CPU']}% | DELAY {current_vector['DELAY']}ms | LOSS {current_vector['LOSS']}% ---")
 
             if "Memory Stress" in parameters.get("environments", {}):
-                parameters["environments"]["Memory Stress"]["value"] = f"{current_mid}{session.unit}"
+                parameters["environments"]["Memory Stress"]["value"] = f"{current_vector['RAM']}M"
+            if "CPU Stress" in parameters.get("environments", {}):
+                parameters["environments"]["CPU Stress"]["value"] = str(current_vector["CPU"])
+            if "Network Delay" in parameters.get("environments", {}):
+                parameters["environments"]["Network Delay"]["value"] = f"{current_vector['DELAY']}ms"
+            if "Network Loss" in parameters.get("environments", {}):
+                parameters["environments"]["Network Loss"]["value"] = str(current_vector["LOSS"])
 
             iter_chaos_parameters = build_chaos_parameters(
                 application=application,
                 environments=environments,
                 parameters=parameters,
-                duration=duration
+                duration=duration,
+                iteration=current_iter
             )
+
+            active_compound_environments = [
+                env for env in FIVE_CHAOS_ENVIRONMENTS
+                if env in environments and env in iter_chaos_parameters
+            ]
 
             five_chaos_parameters = {
                 env: iter_chaos_parameters[env]
-                for env in FIVE_CHAOS_ENVIRONMENTS
-                if env in iter_chaos_parameters
+                for env in active_compound_environments
             }
 
             iter_five_chaos_yaml = generate_compound_chaos_yaml(
-                FIVE_CHAOS_ENVIRONMENTS,
+                active_compound_environments,
                 five_chaos_parameters
             )
 
@@ -3155,13 +3173,12 @@ def process_application(
             write_yaml_file(iter_five_chaos_file, iter_five_chaos_yaml)
             last_five_chaos_file = iter_five_chaos_file
 
-            # Capture 5-chaos stress vector applied in this trial
             chaos_vector = {
-                "memory": f"{current_mid}{session.unit}",
-                "cpu": f"{five_chaos_parameters.get('CPU Stress', {}).get('cpu_load', '60')}%",
-                "delay": str(five_chaos_parameters.get("Network Delay", {}).get("latency", "100ms")),
-                "loss": f"{five_chaos_parameters.get("Network Loss", {}).get("loss_percent", "3")}%",
-                "partition": str(five_chaos_parameters.get("Network Partition", {}).get("target_app", name))
+                "memory": f"{current_vector['RAM']}M",
+                "cpu": f"{current_vector['CPU']}%",
+                "delay": f"{current_vector['DELAY']}ms",
+                "loss": f"{current_vector['LOSS']}%",
+                "partition": str(five_chaos_parameters.get("Network Partition", {}).get("target_app", "None"))
             }
 
             if event_emitter:
@@ -3170,15 +3187,17 @@ def process_application(
                     "stage": "five_chaos",
                     "status": "running",
                     "iteration": current_iter,
-                    "max_iterations": session.max_iterations,
-                    "tested_value": f"{current_mid}{session.unit}"
+                    "max_iterations": multi_session.max_iterations,
+                    "tested_value": f"{current_vector['RAM']}M",
+                    "chaos_vector": chaos_vector
                 })
 
             five_chaos_result = execute_five_chaos(
                 application,
                 iter_five_chaos_file,
                 duration,
-                vus
+                vus,
+                active_environments=active_compound_environments
             )
 
             iter_metrics = collect_result_metrics(
@@ -3190,10 +3209,17 @@ def process_application(
             k6_stage = five_chaos_result.get("k6", {})
             sla_passed, sla_reason = evaluate_sla(k6_stage, iter_metrics)
 
-            step_entry = session.record_result(current_mid, sla_passed, sla_reason, chaos_vector=chaos_vector)
+            step_entry = multi_session.record_trial(
+                current_vector,
+                sla_passed,
+                k6_result=k6_stage,
+                metrics=iter_metrics,
+                reason=sla_reason
+            )
 
-            print(f"Iteration {current_iter} Result: {'PASSED' if sla_passed else 'BREACHED'} ({sla_reason})")
-            print(f"Decision Step: {step_entry['step_taken']} (Remaining Delta: {step_entry['difference_str']})")
+            print(f"Iteration {current_iter} Result: {'PASSED' if sla_passed else 'BREACHED'} ({step_entry['reason']})")
+            print(f"Culprit Dimension: {step_entry['culprit'] or 'None (All Passed)'}")
+            print(f"Decision Step: {step_entry['step_taken']}")
 
             if sla_passed or best_five_chaos_result is None:
                 best_five_chaos_result = five_chaos_result
@@ -3203,26 +3229,26 @@ def process_application(
                 event_emitter.emit("iteration_update", {
                     "service": name,
                     "iteration": step_entry["iteration"],
-                    "max_iterations": session.max_iterations,
-                    "parameter": step_entry["parameter"],
-                    "tested_value": step_entry["tested_value"],
-                    "previous_bounds": step_entry["previous_bounds"],
+                    "max_iterations": multi_session.max_iterations,
+                    "parameter": step_entry.get("culprit") or "Compound",
+                    "tested_value": f"{current_vector['RAM']}M",
                     "sla_passed": step_entry["passed"],
                     "reason": step_entry["reason"],
                     "step_taken": step_entry["step_taken"],
-                    "new_bounds": step_entry["new_bounds"],
+                    "culprit": step_entry["culprit"],
+                    "vector": current_vector,
+                    "parameters_state": step_entry["parameters_state"],
                     "difference": step_entry["difference"],
-                    "difference_str": step_entry["difference_str"],
+                    "difference_str": f"{step_entry['difference']}M",
                     "next_midpoint": step_entry["next_midpoint"],
                     "converged": step_entry["converged"],
                     "chaos_vector": chaos_vector
                 })
 
             if effective_mode == "heuristic":
-                session.converged = True
                 break
 
-            if not session.converged:
+            if not multi_session.converged:
                 time.sleep(2)
 
         result["stages"]["five_chaos"] = best_five_chaos_result
@@ -3295,19 +3321,28 @@ def process_application(
         }
 
         # --------------------------------
-        # Convergence & Right-Sizing Summary
+        # Complete Right-Sizing & Convergence Summary (Limits & Requests)
         # --------------------------------
-        service_passed = any(it["passed"] for it in session.history)
+        service_passed = any(it["passed"] for it in multi_session.history)
         peak_mem_bytes = result.get("metrics", {}).get("memory_max") or 0
         peak_cpu_cores = result.get("metrics", {}).get("cpu_max") or 0
+        baseline_mem_mb = int(peak_mem_bytes / (1024 * 1024)) if peak_mem_bytes else 32
+        baseline_cpu_m = int(peak_cpu_cores * 1000) if peak_cpu_cores else 50
 
-        recommended_mem = f"{max(32, int((peak_mem_bytes * 1.25) / (1024 * 1024)))}Mi" if peak_mem_bytes else "128Mi"
-        recommended_cpu = f"{max(50, int(peak_cpu_cores * 1.25 * 1000))}m" if peak_cpu_cores else "250m"
+        multi_summary = multi_session.summary()
+        safe_ram_mb = multi_session.best_passing_vector["RAM"] if (service_passed and multi_session.best_passing_vector) else (multi_session.sessions["RAM"].best_passing_value if service_passed else 0)
+        recommended_mem_limit = f"{max(64, baseline_mem_mb + int(safe_ram_mb * 1.25))}Mi"
+        recommended_mem_request = f"{max(32, baseline_mem_mb)}Mi"
+
+        recommended_cpu_limit = f"{max(100, int(baseline_cpu_m * 1.25))}m"
+        recommended_cpu_request = f"{max(50, baseline_cpu_m)}m"
+
+        optimal_vals = multi_summary["optimal_values"]
 
         sla_verdict = (
-            f"Optimal safe tolerance: {session.best_passing_value}{session.unit} (Converged in {session.iteration} iterations)"
+            f"Optimal safe tolerances: RAM={optimal_vals['RAM']}, CPU={optimal_vals['CPU']}, DELAY={optimal_vals['DELAY']}, LOSS={optimal_vals['LOSS']} (Converged in {multi_session.iteration} iterations)"
             if service_passed
-            else f"All {session.iteration} iterations breached SLA: {session.history[-1]['reason'] if session.history else 'Unknown'}"
+            else f"All {multi_session.iteration} iterations breached SLA: {multi_session.history[-1]['reason'] if multi_session.history else 'Unknown'}"
         )
 
         optimization_summary = {
@@ -3315,22 +3350,26 @@ def process_application(
             "sla_verdict": sla_verdict,
             "bounds": bounds,
             "recommended_config": {
-                "memory_limit": recommended_mem,
-                "cpu_limit": recommended_cpu
+                "memory_limit": recommended_mem_limit,
+                "memory_request": recommended_mem_request,
+                "cpu_limit": recommended_cpu_limit,
+                "cpu_request": recommended_cpu_request
             },
-            "max_safe_tolerance": f"{session.best_passing_value}{session.unit}" if service_passed else "0M",
-            "iterations": session.history,
-            "summary": session.summary()
+            "optimal_values": optimal_vals,
+            "max_safe_tolerance": optimal_vals["RAM"] if service_passed else "0M",
+            "iterations": multi_session.history,
+            "summary": multi_summary
         }
         result["optimization"] = optimization_summary
 
         print("\n========================================")
-        print("BINARY SEARCH CONVERGENCE SUMMARY")
+        print("MULTI-PARAMETER CONVERGENCE SUMMARY")
         print("========================================")
         print(f"Overall Status:        {'PASSED' if service_passed else 'FAILED'}")
         print(f"SLA Verdict:           {sla_verdict}")
-        print(f"Max Safe Tolerance:    {session.best_passing_value}{session.unit}")
-        print(f"Recommended Limit:     {recommended_mem} Memory | {recommended_cpu} CPU")
+        print(f"Optimal Limits:        RAM {optimal_vals['RAM']} | CPU {optimal_vals['CPU']} | DELAY {optimal_vals['DELAY']} | LOSS {optimal_vals['LOSS']}")
+        print(f"Recommended Limits:    {recommended_mem_limit} Memory | {recommended_cpu_limit} CPU")
+        print(f"Recommended Requests:  {recommended_mem_request} Memory | {recommended_cpu_request} CPU")
         print("========================================")
 
         result["status"] = "completed"
@@ -3373,6 +3412,7 @@ def run_environment(
     duration,
     environments=None,
     mode="binary_search",
+    target_service=None,
     event_emitter=None,
     **kwargs
 ):
@@ -3473,12 +3513,25 @@ def run_environment(
             ]
         })
 
+    if target_service == "discovery_only":
+        print("\nDiscovery-only mode completed. Discovered workloads published to console.")
+        return []
+
+    target_workloads = [w for w in workloads if w.get("name") == target_service] if target_service else workloads
+    if target_service and not target_workloads:
+        print(f"Target service '{target_service}' not found. Available: {[w.get('name') for w in workloads]}")
+        target_workloads = workloads
+
     results = []
 
     for index, application in enumerate(
-        workloads,
+        target_workloads,
         start=1
     ):
+        if event_emitter and getattr(event_emitter, 'is_stopped', False):
+            print("\nOrchestration run stopped by user request.")
+            break
+
         app_name = application.get("name")
 
         if event_emitter:
@@ -3486,7 +3539,7 @@ def run_environment(
             event_emitter.emit("service_start", {
                 "service": app_name,
                 "index": index,
-                "total": len(workloads),
+                "total": len(target_workloads),
                 "namespace": application.get("namespace", "default")
             })
 
