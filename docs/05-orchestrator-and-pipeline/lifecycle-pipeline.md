@@ -25,7 +25,10 @@ The **Environment Orchestrator** executes workloads sequentially microservice by
 |                                                                                 |
 |  [STAGE 3: NODE FAIL]   -> Simulate worker node crash -> Check scheduling       |
 |                                                                                 |
-|  [RIGHT-SIZING]         -> Calculate Requests & Limits (+25% buffer)            |
+|  [RIGHT-SIZING]         -> Dual-Metrics Sizing (Baseline Req + Peak Limits)     |
+|                            Evaluate 4-Case Replicas (Worker, Retries, Singleton)|
+|                            Dynamic Probes (Timeout & Cold-Boot Initial Delay)   |
+|                            Generate & Export {service}-optimized-deployment.yaml|
 |                                                                                 |
 |  [TEARDOWN]             -> Delete Chaos CRDs & Workload Deployment              |
 +---------------------------------------------------------------------------------+

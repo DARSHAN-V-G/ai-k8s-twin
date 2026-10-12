@@ -12,6 +12,10 @@ from services.binary_search_service import (
     MultiParamSearchSession
 )
 from services.environment_validator import validate_environment_parameters
+from services.environment_orchestrator import (
+    determine_recommended_replicas,
+    generate_optimized_deployment_yaml
+)
 
 
 def test_calculate_bounds_with_limits():
@@ -338,6 +342,68 @@ def test_calculate_recommended_config():
     print("test_calculate_recommended_config PASSED")
 
 
+def test_determine_recommended_replicas():
+    # Case 1: Worker / queue consumer
+    worker_app = {"name": "order-processor-worker", "namespace": "production"}
+    reps, reason = determine_recommended_replicas(worker_app)
+    assert reps == 1
+    assert "Case 1" in reason
+
+    # Case 2: Fast recovery with retries
+    fast_app = {"name": "shippingservice", "namespace": "production"}
+    reps, reason = determine_recommended_replicas(fast_app, recovery_time_seconds=0.8)
+    assert reps == 1
+    assert "Case 2" in reason
+
+    # Case 3: Stateful singleton
+    db_app = {"name": "sqlite-db", "namespace": "production", "kind": "StatefulSet"}
+    reps, reason = determine_recommended_replicas(db_app, recovery_time_seconds=5.0)
+    assert reps == 1
+    assert "Case 3" in reason
+
+    # Case 4: Dev / staging environment
+    dev_app = {"name": "frontend", "namespace": "staging"}
+    reps, reason = determine_recommended_replicas(dev_app, recovery_time_seconds=6.0)
+    assert reps == 1
+    assert "Case 4" in reason
+
+    # Default: Synchronous user-facing production workload with slow recovery
+    prod_app = {"name": "frontend", "namespace": "production"}
+    reps, reason = determine_recommended_replicas(prod_app, recovery_time_seconds=4.5)
+    assert reps == 2
+    assert "High Availability" in reason
+    print("test_determine_recommended_replicas PASSED")
+
+
+def test_generate_optimized_deployment_yaml():
+    import yaml
+    app = {
+        "name": "shippingservice",
+        "namespace": "production",
+        "kind": "Deployment"
+    }
+    rec_cfg = {
+        "memory_request": "18Mi",
+        "memory_limit": "32Mi",
+        "cpu_request": "25m",
+        "cpu_limit": "62m"
+    }
+    # Survived delay = 1127ms -> probe timeout should be math.ceil(1127 * 1.25 / 1000) = 2s
+    yaml_str, yaml_file = generate_optimized_deployment_yaml(
+        application=app,
+        recommended_config=rec_cfg,
+        optimal_tolerances={"DELAY": "1127ms"},
+        recovery_time_seconds=4.0
+    )
+    parsed = yaml.safe_load(yaml_str)
+    assert parsed["spec"]["replicas"] == 2
+    assert "High Availability" in parsed["metadata"]["annotations"]["ai-k8s-twin.io/replica-rationale"]
+    container = parsed["spec"]["template"]["spec"]["containers"][0]
+    assert container["resources"]["requests"]["memory"] == "18Mi"
+    assert container["resources"]["limits"]["memory"] == "32Mi"
+    print("test_generate_optimized_deployment_yaml PASSED")
+
+
 if __name__ == "__main__":
     test_calculate_bounds_with_limits()
     test_calculate_bounds_without_limits()
@@ -348,6 +414,8 @@ if __name__ == "__main__":
     test_multi_param_search_session_attribution()
     test_multi_param_stagnation_and_frozen_culprit_termination()
     test_calculate_recommended_config()
+    test_determine_recommended_replicas()
+    test_generate_optimized_deployment_yaml()
     print("\nALL BINARY SEARCH ENGINE TESTS PASSED!")
 
 

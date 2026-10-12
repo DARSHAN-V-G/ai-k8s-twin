@@ -46,6 +46,16 @@ Four high-contrast cards displaying:
 - **Step Decision**: Explains the exact mathematical bound update made (e.g. `> Contracted LOSS Upper Bound: [0.5%, 7.8%] -> [0.5%, 3.9%]. Other dimensions held steady.`).
 - **Strict Clean Typography**: Zero emojis, utilizing monospace tags and design tokens.
 
+### D. Right-Sized Manifest Preview & One-Click Export
+Following multi-stress convergence, the Workload Inspector renders the production-ready Kubernetes manifest:
+- **`[COPY YAML]` Button**: Copies the complete optimized YAML manifest directly to the operating system clipboard with a temporary `[COPIED]` visual badge.
+- **`[DOWNLOAD YAML]` Button**: Triggers an immediate browser download of `{service}-optimized-deployment.yaml`.
+- **Live Code Preview**: Displays the patched deployment specification showing:
+  - Guaranteed scheduling floors (`resources.requests`) based on healthy baseline telemetry.
+  - Safe resilience ceilings (`resources.limits`) with $+25\%$ buffer.
+  - Dynamic replica recommendation (`replicas: 1` or `2`) accompanied by the `ai-k8s-twin.io/replica-rationale` annotation.
+  - Dynamically tuned probe timeouts (`timeoutSeconds`) and cold-boot delays (`initialDelaySeconds`).
+
 ---
 
 ## 4. Live Partitioned Terminal Console

@@ -81,15 +81,51 @@ function App() {
     const memReq = svc.optimization?.recommended_config?.memory_request || '18Mi'
     const cpuLimit = svc.optimization?.recommended_config?.cpu_limit || '62m'
     const cpuReq = svc.optimization?.recommended_config?.cpu_request || '25m'
+
+    // Dynamic Probe Calculation
+    const delayStr = svc.optimization?.optimal_values?.DELAY || '1000ms'
+    const delayMs = parseInt(String(delayStr).replace(/\D/g, ''), 10) || 1000
+    const timeoutSeconds = Math.max(1, Math.ceil((delayMs * 1.25) / 1000))
+    const recoverySec =
+      svc.stages?.pod_kill?.details?.recovery_time_seconds ??
+      svc.stages?.pod_kill?.recovery_time_seconds ??
+      4.0
+    const initialDelaySeconds = Math.max(2, Math.round(recoverySec * 0.75))
+
+    // 4-Case Replica Decision
+    const nameLower = (svc.name || '').toLowerCase()
+    const nsLower = (svc.namespace || 'default').toLowerCase()
+    let replicas = 2
+    let rationale = `High Availability (Synchronous API with cold-boot ${recoverySec.toFixed(1)}s requires HA)`
+
+    if (['dev', 'staging', 'development', 'test', 'qa'].includes(nsLower)) {
+      replicas = 1
+      rationale = 'Case 4: Non-Production/Dev Environment (cost savings priority over multi-replica HA)'
+    } else if (
+      svc.kind === 'StatefulSet' ||
+      ['sqlite', 'singleton', 'coordinator', 'leader'].some((k) => nameLower.includes(k))
+    ) {
+      replicas = 1
+      rationale = 'Case 3: Stateful Singleton (single-writer constraint prevents split-brain)'
+    } else if (['worker', 'consumer', 'queue', 'processor', 'job'].some((k) => nameLower.includes(k))) {
+      replicas = 1
+      rationale = 'Case 1: Asynchronous Worker/Queue Consumer (jobs buffer safely in queue during restart)'
+    } else if (recoverySec <= 1.5) {
+      replicas = 1
+      rationale = `Case 2: Fast Recovery (${recoverySec.toFixed(2)}s restart is masked by client retries)`
+    }
+
     return `apiVersion: apps/v1
-kind: Deployment
+kind: ${svc.kind || 'Deployment'}
 metadata:
   name: ${svc.name}
   namespace: ${svc.namespace || 'default'}
   labels:
     app: ${svc.name}
+  annotations:
+    ai-k8s-twin.io/replica-rationale: "${rationale}"
 spec:
-  replicas: 1
+  replicas: ${replicas}
   selector:
     matchLabels:
       app: ${svc.name}
@@ -112,7 +148,14 @@ spec:
             httpGet:
               path: /health
               port: 8080
-            timeoutSeconds: 2`
+            initialDelaySeconds: ${initialDelaySeconds}
+            timeoutSeconds: ${timeoutSeconds}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: ${initialDelaySeconds}
+            timeoutSeconds: ${timeoutSeconds}`
   }
 
   const addLogEntry = (serviceName, type, text) => {

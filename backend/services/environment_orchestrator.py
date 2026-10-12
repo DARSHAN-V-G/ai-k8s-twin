@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shutil
@@ -506,14 +507,74 @@ def find_application_resource(
     )
 
 
+def determine_recommended_replicas(
+    application,
+    doc=None,
+    recovery_time_seconds=None
+):
+    """
+    Evaluates whether the service needs replicas: 2 (High Availability) or
+    if replicas: 1 is optimal based on the 4 architectural criteria:
+    - Case 1: Asynchronous Queue / Background Worker (queue buffers jobs, 0 HTTP failures)
+    - Case 2: Fast Recovery With Client Retries (recovery_time_seconds <= 1.5s masked by mesh retries)
+    - Case 3: Stateful Singletons / Single-Writer Constraint (prevents split-brain / disk lock corruption)
+    - Case 4: Non-Production / Dev Environment (cost priority over HA)
+    """
+    name = str(application.get("name") or "").lower()
+    namespace = str(application.get("namespace") or "default").lower()
+    env = str(application.get("environment") or os.environ.get("ENVIRONMENT") or "").lower()
+
+    # Extract spec & container info
+    spec = (doc.get("spec") or {}) if isinstance(doc, dict) else {}
+    template_spec = spec.get("template", {}).get("spec", {}) if "template" in spec else spec
+    containers = template_spec.get("containers", [])
+    has_ports = any(bool(c.get("ports")) for c in containers) if containers else True
+
+    # Case 4: Non-Production / Dev Environments (Cost Priority)
+    if (
+        env in ["dev", "staging", "development", "test", "qa"]
+        or namespace in ["dev", "staging", "development", "test", "qa"]
+        or application.get("cost_priority")
+    ):
+        return 1, "Case 4: Non-Production/Dev Environment (cost savings priority over multi-replica HA)"
+
+    # Case 3: Stateful Singletons (Single-Writer Constraint)
+    kind = str(application.get("kind") or (doc.get("kind") if isinstance(doc, dict) else "") or "").lower()
+    has_pvc = bool(template_spec.get("volumes", [])) and any("persistentVolumeClaim" in v for v in template_spec.get("volumes", []))
+    is_stateful = kind == "statefulset" or "volumeclaimtemplates" in [k.lower() for k in spec.keys()] or has_pvc
+    singleton_keywords = ["singleton", "sqlite", "coordinator", "leader", "single-writer"]
+    if is_stateful or any(kw in name for kw in singleton_keywords):
+        return 1, "Case 3: Stateful Singleton (single-writer constraint prevents split-brain/data corruption)"
+
+    # Case 1: Asynchronous Queue / Background Workers
+    worker_keywords = ["worker", "consumer", "queue", "processor", "job", "celery", "task-runner"]
+    is_worker = (
+        application.get("type") in ["worker", "consumer", "job", "queue"]
+        or any(kw in name for kw in worker_keywords)
+        or application.get("is_worker") is True
+    )
+    if is_worker:
+        return 1, "Case 1: Asynchronous Worker/Queue Consumer (jobs buffer safely in queue during restart, 0 HTTP failures)"
+
+    # Case 2: Fast Recovery With Client Retries
+    if recovery_time_seconds is not None and float(recovery_time_seconds) <= 1.5:
+        return 1, f"Case 2: Fast Recovery ({float(recovery_time_seconds):.2f}s restart is fully masked by upstream client retries)"
+
+    # Default for Synchronous User-Facing Production Workloads:
+    boot_str = f"measured cold-boot time {float(recovery_time_seconds):.2f}s" if recovery_time_seconds is not None else "synchronous API"
+    return 2, f"High Availability ({boot_str} requires multi-replica redundancy to prevent downtime)"
+
+
 def generate_optimized_deployment_yaml(
     application,
     recommended_config,
-    optimal_tolerances=None
+    optimal_tolerances=None,
+    recovery_time_seconds=None
 ):
     """
     Finds the application's Kubernetes resource manifest, clones it,
-    injects the recommended limits and requests, tunes probe timeouts,
+    injects the recommended limits and requests, tunes replicas (1 vs 2) using 4 criteria,
+    tunes probe timeouts dynamically based on survived network latency and cold-boot recovery time,
     and writes it to generated/{name}-optimized-deployment.yaml.
     """
     import copy
@@ -547,6 +608,34 @@ def generate_optimized_deployment_yaml(
         }
 
     spec = doc.get("spec", {})
+    if not isinstance(spec, dict):
+        spec = {}
+        doc["spec"] = spec
+
+    # 1. Determine recommended replicas using the 4 architectural criteria
+    recommended_replicas, replica_reason = determine_recommended_replicas(
+        application=application,
+        doc=doc,
+        recovery_time_seconds=recovery_time_seconds
+    )
+    spec["replicas"] = recommended_replicas
+
+    # Store replica decision rationale in metadata annotations
+    annotations = doc.setdefault("metadata", {}).setdefault("annotations", {})
+    annotations["ai-k8s-twin.io/replica-rationale"] = replica_reason
+
+    # 2. Compute dynamic probe timeout from survived DELAY
+    delay_str = "1000ms"
+    if optimal_tolerances and isinstance(optimal_tolerances, dict):
+        delay_str = str(optimal_tolerances.get("DELAY", "1000ms"))
+    delay_digits = "".join(filter(str.isdigit, delay_str))
+    delay_ms = int(delay_digits) if delay_digits else 1000
+    safe_timeout_seconds = max(1, math.ceil((delay_ms * 1.25) / 1000.0))
+
+    # 3. Compute dynamic initialDelaySeconds from cold boot recovery time
+    boot_sec = float(recovery_time_seconds) if recovery_time_seconds is not None else 4.0
+    safe_initial_delay = max(2, int(round(boot_sec * 0.75)))
+
     template_spec = spec.get("template", {}).get("spec", {}) if "template" in spec else spec
     containers = template_spec.get("containers", [])
     if containers:
@@ -563,8 +652,8 @@ def generate_optimized_deployment_yaml(
         }
         for probe_key in ["livenessProbe", "readinessProbe", "startupProbe"]:
             if probe_key in container and isinstance(container[probe_key], dict):
-                current_timeout = container[probe_key].get("timeoutSeconds", 1)
-                container[probe_key]["timeoutSeconds"] = max(current_timeout, 2)
+                container[probe_key]["timeoutSeconds"] = safe_timeout_seconds
+                container[probe_key]["initialDelaySeconds"] = safe_initial_delay
 
     yaml_str = yaml.dump(doc, sort_keys=False, default_flow_style=False)
 
@@ -3420,6 +3509,7 @@ def process_application(
         baseline_cpu_m = int(peak_cpu_cores * 1000) if peak_cpu_cores else 50
 
         multi_summary = multi_session.summary()
+        optimal_vals = multi_summary.get("optimal_values", {})
         safe_ram_mb = multi_session.best_passing_vector["RAM"] if (service_passed and multi_session.best_passing_vector) else (multi_session.sessions["RAM"].best_passing_value if service_passed else 0)
         safe_cpu_pct = multi_session.best_passing_vector["CPU"] if (service_passed and multi_session.best_passing_vector) else (multi_session.sessions["CPU"].best_passing_value if service_passed else 10)
 
@@ -3455,14 +3545,13 @@ def process_application(
                 "cpu_limit": recommended_cpu_limit,
                 "cpu_request": recommended_cpu_request
             },
-            optimal_tolerances=optimal_vals
+            optimal_tolerances=optimal_vals,
+            recovery_time_seconds=pod_kill_result.get("recovery_time_seconds") if isinstance(pod_kill_result, dict) else None
         )
         print(f"\nGenerated Right-Sized Manifest: {optimized_yaml_file}")
 
-        optimal_vals = multi_summary["optimal_values"]
-
         sla_verdict = (
-            f"Optimal safe tolerances: RAM={optimal_vals['RAM']}, CPU={optimal_vals['CPU']}, DELAY={optimal_vals['DELAY']}, LOSS={optimal_vals['LOSS']} (Converged in {multi_session.iteration} iterations)"
+            f"Optimal safe tolerances: RAM={optimal_vals.get('RAM', 'N/A')}, CPU={optimal_vals.get('CPU', 'N/A')}, DELAY={optimal_vals.get('DELAY', 'N/A')}, LOSS={optimal_vals.get('LOSS', 'N/A')} (Converged in {multi_session.iteration} iterations)"
             if service_passed
             else f"All {multi_session.iteration} iterations breached SLA: {multi_session.history[-1]['reason'] if multi_session.history else 'Unknown'}"
         )
@@ -3478,7 +3567,7 @@ def process_application(
                 "cpu_request": recommended_cpu_request
             },
             "optimal_values": optimal_vals,
-            "max_safe_tolerance": optimal_vals["RAM"] if service_passed else "0M",
+            "max_safe_tolerance": optimal_vals.get("RAM", "0M") if service_passed else "0M",
             "iterations": multi_session.history,
             "summary": multi_summary,
             "optimized_yaml": optimized_yaml_str,
@@ -3492,7 +3581,7 @@ def process_application(
         print("========================================")
         print(f"Overall Status:        {'PASSED' if service_passed else 'FAILED'}")
         print(f"SLA Verdict:           {sla_verdict}")
-        print(f"Optimal Limits:        RAM {optimal_vals['RAM']} | CPU {optimal_vals['CPU']} | DELAY {optimal_vals['DELAY']} | LOSS {optimal_vals['LOSS']}")
+        print(f"Optimal Limits:        RAM {optimal_vals.get('RAM', 'N/A')} | CPU {optimal_vals.get('CPU', 'N/A')} | DELAY {optimal_vals.get('DELAY', 'N/A')} | LOSS {optimal_vals.get('LOSS', 'N/A')}")
         print(f"Recommended Limits:    {recommended_mem_limit} Memory | {recommended_cpu_limit} CPU")
         print(f"Recommended Requests:  {recommended_mem_request} Memory | {recommended_cpu_request} CPU")
         print("========================================")
