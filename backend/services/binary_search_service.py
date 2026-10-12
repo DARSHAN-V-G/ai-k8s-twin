@@ -41,26 +41,26 @@ def calculate_bounds(application, cluster_cpu="2", cluster_memory="4Gi"):
         "Memory Stress": {
             "low": 1,
             "high": max_mem_mb,
-            "unit": "M",
-            "threshold": 16  # Stop search when difference <= 16M (or <= 1M if no trial has passed)
+            "unit": "Mi",
+            "threshold": 1  # Stop search when difference <= 16M (or <= 1M if no trial has passed)
         },
         "CPU Stress": {
             "low": 10,
             "high": 100,
             "unit": "",
-            "threshold": 5   # Stop search when within 5%
+            "threshold": 1   # Stop search when within 5%
         },
         "Network Delay": {
             "low": 10,
-            "high": 1500,
+            "high": 400,
             "unit": "ms",
-            "threshold": 25  # Stop search when within 25ms
+            "threshold": 1  # Stop search when within 20ms
         },
         "Network Loss": {
-            "low": 0.5,
-            "high": 15.0,
+            "low": 0.0,
+            "high": 1.0,
             "unit": "%",
-            "threshold": 0.5  # Stop search when within 0.5%
+            "threshold": 0.01  # Stop search when within 0.1%
         }
     }
 
@@ -188,7 +188,7 @@ def generate_heuristic_parameters(application, environments, cpu="2", memory="4G
         if env == "CPU Stress":
             parameters["CPU Stress"] = {"value": cpu_stress_val}
         elif env == "Memory Stress":
-            parameters["Memory Stress"] = {"value": f"{stress_mb}M"}
+            parameters["Memory Stress"] = {"value": f"{stress_mb}Mi"}
         elif env == "Network Delay":
             parameters["Network Delay"] = {"value": delay_ms}
         elif env == "Network Loss":
@@ -337,16 +337,16 @@ class MultiParamSearchSession:
         self.best_passing_vector = None
         self._converged_forced = False
 
-        ram_cfg = bounds.get("Memory Stress", {"low": 1, "high": 128, "unit": "M", "threshold": 16})
+        ram_cfg = bounds.get("Memory Stress", {"low": 1, "high": 128, "unit": "Mi", "threshold": 16})
         cpu_cfg = bounds.get("CPU Stress", {"low": 10, "high": 100, "unit": "%", "threshold": 5})
-        delay_cfg = bounds.get("Network Delay", {"low": 10, "high": 1500, "unit": "ms", "threshold": 25})
-        loss_cfg = bounds.get("Network Loss", {"low": 0.5, "high": 15.0, "unit": "%", "threshold": 0.5})
+        delay_cfg = bounds.get("Network Delay", {"low": 10, "high": 400, "unit": "ms", "threshold": 20})
+        loss_cfg = bounds.get("Network Loss", {"low": 0.0, "high": 1.0, "unit": "%", "threshold": 0.1})
 
         self.sessions = {
-            "RAM": BinarySearchSession("RAM", low=ram_cfg.get("low", 1), high=ram_cfg["high"], unit=ram_cfg.get("unit", "M"), threshold=ram_cfg.get("threshold", 16), max_iterations=max_iterations, is_float=False),
+            "RAM": BinarySearchSession("RAM", low=ram_cfg.get("low", 1), high=ram_cfg["high"], unit=ram_cfg.get("unit", "Mi"), threshold=ram_cfg.get("threshold", 16), max_iterations=max_iterations, is_float=False),
             "CPU": BinarySearchSession("CPU", low=cpu_cfg.get("low", 10), high=cpu_cfg["high"], unit=cpu_cfg.get("unit", "%"), threshold=cpu_cfg.get("threshold", 5), max_iterations=max_iterations, is_float=False),
-            "DELAY": BinarySearchSession("DELAY", low=delay_cfg.get("low", 10), high=delay_cfg["high"], unit=delay_cfg.get("unit", "ms"), threshold=delay_cfg.get("threshold", 25), max_iterations=max_iterations, is_float=False),
-            "LOSS": BinarySearchSession("LOSS", low=loss_cfg.get("low", 0.5), high=loss_cfg["high"], unit=loss_cfg.get("unit", "%"), threshold=loss_cfg.get("threshold", 0.5), max_iterations=max_iterations, is_float=True),
+            "DELAY": BinarySearchSession("DELAY", low=delay_cfg.get("low", 10), high=delay_cfg["high"], unit=delay_cfg.get("unit", "ms"), threshold=delay_cfg.get("threshold", 20), max_iterations=max_iterations, is_float=False),
+            "LOSS": BinarySearchSession("LOSS", low=loss_cfg.get("low", 0.0), high=loss_cfg["high"], unit=loss_cfg.get("unit", "%"), threshold=loss_cfg.get("threshold", 0.1), max_iterations=max_iterations, is_float=True),
         }
 
     @property
@@ -434,7 +434,7 @@ class MultiParamSearchSession:
                 step_taken += " Reached fixed-point boundary (no further unique vectors). Converged."
 
         vector_display = {
-            "memory": f"{tested_vector['RAM']}M",
+            "memory": f"{tested_vector['RAM']}Mi",
             "cpu": f"{tested_vector['CPU']}%",
             "delay": f"{tested_vector['DELAY']}ms",
             "loss": f"{tested_vector['LOSS']}%"
@@ -450,9 +450,9 @@ class MultiParamSearchSession:
             "reason": trial_reason,
             "step_taken": step_taken,
             "next_vector": next_vector,
-            "next_midpoint": f"{next_vector['RAM']}M" if next_vector else None,
+            "next_midpoint": f"{next_vector['RAM']}Mi" if next_vector else None,
             "converged": self.converged,
-            "tested_value": f"{tested_vector['RAM']}M",
+            "tested_value": f"{tested_vector['RAM']}Mi",
             "recommended_config": recommended_config,
             "difference": self.sessions["RAM"].high - self.sessions["RAM"].low,
             "parameters_state": {

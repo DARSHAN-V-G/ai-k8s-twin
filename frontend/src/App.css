@@ -1153,49 +1153,103 @@ code, pre, .terminal-window, .stage-step, .status-pill, .badge {
   font-size: 10px;
 }
 
-/* Optimized Kubernetes Manifest Card */
-.manifest-export-card {
-  margin-top: 16px;
-  background: #ffffff;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+/* ==========================================================================
+   Modern Cloud IDE Manifest Studio Editor
+   ========================================================================== */
+
+.manifest-ide-card {
+  margin-top: 14px;
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
   overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  transition: all 0.25s ease;
+  width: 100%;
 }
 
-.manifest-export-header {
+.manifest-ide-card.is-expanded {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.manifest-ide-titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  background: #fbfaf7;
-  border-bottom: 1px solid var(--line);
+  padding: 8px 14px;
+  background: #1e293b;
+  border-bottom: 1px solid #334155;
   flex-wrap: wrap;
   gap: 10px;
 }
 
-.manifest-title-group {
+.ide-window-dots {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ide-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-close {
+  background: #ef4444;
+}
+
+.dot-min {
+  background: #f59e0b;
+}
+
+.dot-max {
+  background: #10b981;
+}
+
+.ide-file-tab {
   display: flex;
   align-items: center;
   gap: 8px;
+  background: #0f172a;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid #334155;
 }
 
-.manifest-title {
+.ide-file-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 800;
+  color: #38bdf8;
+  letter-spacing: 0.5px;
+}
+
+.ide-filename {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: var(--ink);
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.ide-header-badges {
+  display: flex;
+  align-items: center;
 }
 
 .manifest-badge {
   font-family: 'JetBrains Mono', monospace;
   font-size: 9px;
   font-weight: 700;
-  color: #15803d;
-  background: #dcfce7;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  border: 1px solid #86efac;
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid #059669;
+  padding: 2px 7px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
 }
 
 .manifest-actions {
@@ -1205,48 +1259,191 @@ code, pre, .terminal-window, .stage-step, .status-pill, .badge {
 }
 
 .btn-manifest-action {
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  border-radius: 4px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
   font-weight: 700;
-  background: #ffffff;
-  color: var(--ink);
-  border: 1px solid var(--line);
+  background: #0f172a;
+  color: #94a3b8;
+  border: 1px solid #334155;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s ease;
 }
 
 .btn-manifest-action:hover {
-  background: var(--paper);
-  border-color: var(--ink);
+  background: #334155;
+  color: #f8fafc;
+  border-color: #64748b;
 }
 
 .btn-manifest-download {
-  background: var(--ink);
+  background: #0284c7;
   color: #ffffff;
-  border-color: var(--ink);
+  border-color: #0ea5e9;
 }
 
 .btn-manifest-download:hover {
-  background: #000000;
+  background: #0369a1;
+  border-color: #0284c7;
+  color: #ffffff;
 }
 
-.manifest-code-wrapper {
-  max-height: 260px;
-  overflow-y: auto;
-  background: #18181b;
-}
-
-.manifest-code-block {
-  margin: 0;
-  padding: 14px 16px;
+/* Quick Metrics Ribbon */
+.ide-telemetry-ribbon {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 14px;
+  background: #0b1120;
+  border-bottom: 1px solid #1e293b;
   font-family: 'JetBrains Mono', monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  color: #e4e4e7;
-  white-space: pre-wrap;
-  word-break: break-all;
+  font-size: 10px;
+  color: #94a3b8;
+  flex-wrap: wrap;
+}
+
+.ribbon-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ribbon-label {
+  color: #64748b;
+  font-weight: 600;
+}
+
+.ribbon-item strong {
+  color: #38bdf8;
+  font-weight: 700;
+}
+
+.ribbon-divider {
+  color: #334155;
+}
+
+/* Editor Body & Code Layout */
+.manifest-ide-editor-body {
+  position: relative;
+  background: #090d16;
+}
+
+.manifest-ide-card .yaml-code-scrollable {
+  max-height: 360px;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding: 10px 0;
+  scrollbar-width: thin;
+  scrollbar-color: #334155 #090d16;
+  transition: max-height 0.25s ease;
+}
+
+.manifest-ide-card.is-expanded .yaml-code-scrollable {
+  max-height: 700px;
+}
+
+.yaml-code-scrollable::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.yaml-code-scrollable::-webkit-scrollbar-track {
+  background: #090d16;
+}
+
+.yaml-code-scrollable::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+.yaml-code-scrollable::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Line Layout */
+.yaml-editor-line {
+  display: flex;
+  align-items: baseline;
+  line-height: 1.6;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  font-size: 11.5px;
+  padding: 0 12px;
+  transition: background 0.1s ease;
+}
+
+.yaml-editor-line:hover {
+  background: rgba(30, 41, 59, 0.7);
+}
+
+.yaml-line-num {
+  width: 32px;
+  flex-shrink: 0;
+  text-align: right;
+  padding-right: 14px;
+  color: #475569;
+  user-select: none;
+  font-size: 10.5px;
+  border-right: 1px solid #1e293b;
+  margin-right: 12px;
+}
+
+.yaml-line-content {
+  flex: 1;
+  white-space: pre !important;
+  word-break: normal !important;
+  overflow-wrap: normal !important;
+  color: #cbd5e1;
+}
+
+/* Syntax Highlighting Colors */
+.yaml-key {
+  color: #38bdf8;
+  font-weight: 600;
+}
+
+.yaml-key-accent {
+  color: #67e8f9;
+  font-weight: 700;
+  text-shadow: 0 0 8px rgba(103, 232, 249, 0.35);
+}
+
+.yaml-colon {
+  color: #94a3b8;
+  margin-right: 2px;
+}
+
+.yaml-val-str {
+  color: #34d399;
+}
+
+.yaml-val-num {
+  color: #fb923c;
+  font-weight: 600;
+}
+
+.yaml-val-quote {
+  color: #fde047;
+}
+
+.yaml-comment {
+  color: #64748b;
+  font-style: italic;
+}
+
+.yaml-bullet {
+  color: #cbd5e1;
+  font-weight: 700;
+}
+
+.yaml-indent {
+  white-space: pre;
+}
+
+.yaml-patched-key-line {
+  background: rgba(56, 189, 248, 0.08);
+  border-radius: 2px;
+  padding: 0 3px;
 }
 
 .error-banner {

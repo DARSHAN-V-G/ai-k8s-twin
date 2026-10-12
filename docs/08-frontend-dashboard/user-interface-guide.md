@@ -30,8 +30,8 @@ A walkthrough of the AI K8s Twin dashboard panels and design elements.
 Displays active bounds and safe tolerance metrics across all 4 dimensions:
 1. **RAM STRESS**: Safe tolerance (e.g. `64M`), bounds `[1M, 128M]`, status `[CONVERGED]` / `[TUNING]`.
 2. **CPU SATURATION**: Safe tolerance (e.g. `75%`), bounds `[10%, 100%]`, status `[CONVERGED]` / `[TUNING]`.
-3. **NETWORK DELAY**: Safe tolerance (e.g. `350ms`), bounds `[10ms, 1500ms]`, status `[CONVERGED]` / `[TUNING]`.
-4. **PACKET LOSS**: Safe tolerance (e.g. `4.2%`), bounds `[0.5%, 15.0%]`, status `[CONVERGED]` / `[TUNING]`.
+3. **NETWORK DELAY**: Safe tolerance (e.g. `200ms`), bounds `[10ms, 400ms]`, status `[CONVERGED]` / `[TUNING]`.
+4. **PACKET LOSS**: Safe tolerance (e.g. `0.5%`), bounds `[0.0%, 1.0%]`, status `[CONVERGED]` / `[TUNING]`.
 
 ### B. Dual Right-Sizing Grid
 Four high-contrast cards displaying:

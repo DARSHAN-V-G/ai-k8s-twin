@@ -3288,7 +3288,7 @@ def process_application(
         print(f"\n========================================")
         print(f"RESILIENCE & MULTI-PARAM OPTIMIZATION LOOP ({name})")
         print(f"Mode: {effective_mode} | Testing 4 Dimensions: RAM, CPU, DELAY, LOSS")
-        print(f"Bounds: RAM [{bounds['Memory Stress']['low']}M, {bounds['Memory Stress']['high']}M] | CPU [{bounds['CPU Stress']['low']}%, {bounds['CPU Stress']['high']}%] | DELAY [{bounds['Network Delay']['low']}ms, {bounds['Network Delay']['high']}ms] | LOSS [{bounds['Network Loss']['low']}%, {bounds['Network Loss']['high']}%]")
+        print(f"Bounds: RAM [{bounds['Memory Stress']['low']}Mi, {bounds['Memory Stress']['high']}Mi] | CPU [{bounds['CPU Stress']['low']}%, {bounds['CPU Stress']['high']}%] | DELAY [{bounds['Network Delay']['low']}ms, {bounds['Network Delay']['high']}ms] | LOSS [{bounds['Network Loss']['low']}%, {bounds['Network Loss']['high']}%]")
         print(f"========================================")
 
         while not multi_session.converged and multi_session.iteration < multi_session.max_iterations:
@@ -3298,10 +3298,10 @@ def process_application(
 
             current_vector = multi_session.next_vector()
             current_iter = multi_session.iteration + 1
-            print(f"\n--- [Iteration {current_iter}] Testing Compound Vector: RAM {current_vector['RAM']}M | CPU {current_vector['CPU']}% | DELAY {current_vector['DELAY']}ms | LOSS {current_vector['LOSS']}% ---")
+            print(f"\n--- [Iteration {current_iter}] Testing Compound Vector: RAM {current_vector['RAM']}Mi | CPU {current_vector['CPU']}% | DELAY {current_vector['DELAY']}ms | LOSS {current_vector['LOSS']}% ---")
 
             if "Memory Stress" in parameters.get("environments", {}):
-                parameters["environments"]["Memory Stress"]["value"] = f"{current_vector['RAM']}M"
+                parameters["environments"]["Memory Stress"]["value"] = f"{current_vector['RAM']}Mi"
             if "CPU Stress" in parameters.get("environments", {}):
                 parameters["environments"]["CPU Stress"]["value"] = str(current_vector["CPU"])
             if "Network Delay" in parameters.get("environments", {}):
@@ -3340,7 +3340,7 @@ def process_application(
             last_five_chaos_file = iter_five_chaos_file
 
             chaos_vector = {
-                "memory": f"{current_vector['RAM']}M",
+                "memory": f"{current_vector['RAM']}Mi",
                 "cpu": f"{current_vector['CPU']}%",
                 "delay": f"{current_vector['DELAY']}ms",
                 "loss": f"{current_vector['LOSS']}%",
@@ -3354,7 +3354,7 @@ def process_application(
                     "status": "running",
                     "iteration": current_iter,
                     "max_iterations": multi_session.max_iterations,
-                    "tested_value": f"{current_vector['RAM']}M",
+                    "tested_value": f"{current_vector['RAM']}Mi",
                     "chaos_vector": chaos_vector
                 })
 
@@ -3409,7 +3409,7 @@ def process_application(
                     "iteration": step_entry["iteration"],
                     "max_iterations": multi_session.max_iterations,
                     "parameter": step_entry.get("culprit") or "Compound",
-                    "tested_value": f"{current_vector['RAM']}M",
+                    "tested_value": f"{current_vector['RAM']}Mi",
                     "sla_passed": step_entry["passed"],
                     "reason": step_entry["reason"],
                     "step_taken": step_entry["step_taken"],
@@ -3417,7 +3417,7 @@ def process_application(
                     "vector": current_vector,
                     "parameters_state": step_entry["parameters_state"],
                     "difference": step_entry["difference"],
-                    "difference_str": f"{step_entry['difference']}M",
+                    "difference_str": f"{step_entry['difference']}Mi",
                     "next_midpoint": step_entry["next_midpoint"],
                     "converged": step_entry["converged"],
                     "chaos_vector": chaos_vector,
@@ -3567,7 +3567,7 @@ def process_application(
                 "cpu_request": recommended_cpu_request
             },
             "optimal_values": optimal_vals,
-            "max_safe_tolerance": optimal_vals.get("RAM", "0M") if service_passed else "0M",
+            "max_safe_tolerance": optimal_vals.get("RAM", "0Mi") if service_passed else "0Mi",
             "iterations": multi_session.history,
             "summary": multi_summary,
             "optimized_yaml": optimized_yaml_str,

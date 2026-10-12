@@ -32,8 +32,9 @@ def test_calculate_bounds_with_limits():
     assert bounds["Memory Stress"]["high"] == 134 or bounds["Memory Stress"]["high"] == 128 or bounds["Memory Stress"]["high"] > 100
     assert bounds["Memory Stress"]["low"] == 1
     assert bounds["CPU Stress"]["high"] == 100
-    assert bounds["Network Delay"]["high"] == 1500
-    assert bounds["Network Loss"]["high"] == 15.0
+    assert bounds["Network Delay"]["high"] == 400
+    assert bounds["Network Loss"]["low"] == 0.0
+    assert bounds["Network Loss"]["high"] == 1.0
     print("test_calculate_bounds_with_limits PASSED")
 
 
@@ -144,19 +145,19 @@ def test_binary_search_session_convergence():
         parameter_name="Memory Stress",
         low=16,
         high=134,
-        unit="M",
+        unit="Mi",
         threshold=16,
         max_iterations=8
     )
 
-    # Simulated breaking point at 90M
+    # Simulated breaking point at 90Mi
     breaking_point = 90
 
     while not session.converged:
         val = session.next_value()
         test_passed = val <= breaking_point
         chaos_vector = {
-            "memory": f"{val}M",
+            "memory": f"{val}Mi",
             "cpu": "60%",
             "delay": "100ms",
             "loss": "3%",
@@ -170,8 +171,8 @@ def test_binary_search_session_convergence():
     assert summary["converged"]
     last_diff = session.history[-1]["difference"]
     assert last_diff <= 16
-    assert int(summary["max_safe_tolerance"].rstrip("M")) <= breaking_point
-    print(f"test_binary_search_session_convergence PASSED: converged at {summary['max_safe_tolerance']} in {summary['iterations_run']} iterations (diff={last_diff}M <= 16M)")
+    assert int(summary["max_safe_tolerance"].rstrip("Mi")) <= breaking_point
+    print(f"test_binary_search_session_convergence PASSED: converged at {summary['max_safe_tolerance']} in {summary['iterations_run']} iterations (diff={last_diff}Mi <= 16Mi)")
 
 
 
@@ -181,7 +182,7 @@ def test_binary_search_session_no_success_searches_down_to_one():
         parameter_name="Memory Stress",
         low=1,
         high=134,
-        unit="M",
+        unit="Mi",
         threshold=16,
         max_iterations=10
     )
@@ -196,12 +197,12 @@ def test_binary_search_session_no_success_searches_down_to_one():
     assert not session.has_passed
     last_diff = session.history[-1]["difference"]
     assert last_diff <= 1, f"Expected diff <= 1 when no trial passed, got {last_diff}"
-    print(f"test_binary_search_session_no_success_searches_down_to_one PASSED: search continued until diff={last_diff}M <= 1M")
+    print(f"test_binary_search_session_no_success_searches_down_to_one PASSED: search continued until diff={last_diff}Mi <= 1Mi")
 
 
 def test_multi_param_search_session_attribution():
     bounds = {
-        "Memory Stress": {"low": 1, "high": 128, "unit": "M", "threshold": 16},
+        "Memory Stress": {"low": 1, "high": 128, "unit": "Mi", "threshold": 16},
         "CPU Stress": {"low": 10, "high": 100, "unit": "%", "threshold": 5},
         "Network Delay": {"low": 10, "high": 1500, "unit": "ms", "threshold": 25},
         "Network Loss": {"low": 0.5, "high": 15.0, "unit": "%", "threshold": 0.5}
@@ -273,18 +274,18 @@ def test_multi_param_search_session_attribution():
 
 def test_multi_param_stagnation_and_frozen_culprit_termination():
     bounds = {
-        "Memory Stress": {"low": 1, "high": 134, "unit": "M", "threshold": 16},
+        "Memory Stress": {"low": 1, "high": 134, "unit": "Mi", "threshold": 16},
         "CPU Stress": {"low": 10, "high": 100, "unit": "%", "threshold": 5},
         "Network Delay": {"low": 10, "high": 1500, "unit": "ms", "threshold": 25},
         "Network Loss": {"low": 0.5, "high": 15.0, "unit": "%", "threshold": 0.5}
     }
     multi_session = MultiParamSearchSession(bounds=bounds, max_iterations=10)
 
-    # Trial 1: RAM 67M -> PASS
+    # Trial 1: RAM 67Mi -> PASS
     v1 = multi_session.next_vector()
     multi_session.record_trial(v1, True, k6_result={"status": "completed", "error_rate_percent": 0.0, "p95_ms": 100.0})
 
-    # Trial 2: RAM 100M -> PASS
+    # Trial 2: RAM 100Mi -> PASS
     v2 = multi_session.next_vector()
     multi_session.record_trial(v2, True, k6_result={"status": "completed", "error_rate_percent": 0.0, "p95_ms": 100.0})
 
@@ -305,7 +306,7 @@ def test_multi_param_stagnation_and_frozen_culprit_termination():
 
     summary = multi_session.summary()
     assert summary["converged"]
-    assert summary["optimal_values"]["RAM"] == "100M"
+    assert summary["optimal_values"]["RAM"] == "100Mi"
     print(f"test_multi_param_stagnation_and_frozen_culprit_termination PASSED (terminated cleanly in {multi_session.iteration} iterations)")
 
 

@@ -27,6 +27,69 @@ const DEFAULT_FORM = {
   mode: 'binary_search',
 }
 
+function highlightYamlLine(line) {
+  if (line == null) return null
+  const trimmed = line.trim()
+  if (!trimmed) return <span>&nbsp;</span>
+
+  if (trimmed.startsWith('#')) {
+    return <span className="yaml-comment">{line}</span>
+  }
+
+  const kvMatch = line.match(/^(\s*(?:-\s*)?)([a-zA-Z0-9_./-]+)(:)(.*)$/)
+  if (kvMatch) {
+    const [, indent, key, colon, valueWithPossibleComment] = kvMatch
+    const isSpecialPatchedKey = [
+      'replicas',
+      'requests',
+      'limits',
+      'memory',
+      'cpu',
+      'timeoutSeconds',
+      'initialDelaySeconds',
+    ].includes(key)
+
+    let valuePart = valueWithPossibleComment
+    let commentPart = ''
+    const commentIdx = valueWithPossibleComment.indexOf('#')
+    if (commentIdx !== -1) {
+      valuePart = valueWithPossibleComment.slice(0, commentIdx)
+      commentPart = valueWithPossibleComment.slice(commentIdx)
+    }
+
+    const valTrim = valuePart.trim()
+    let valClass = 'yaml-val-str'
+    if (/^-?\d+(\.\d+)?$/.test(valTrim) || /^(true|false|null)$/i.test(valTrim)) {
+      valClass = 'yaml-val-num'
+    } else if (valTrim.startsWith("'") || valTrim.startsWith('"')) {
+      valClass = 'yaml-val-quote'
+    }
+
+    return (
+      <span className={isSpecialPatchedKey ? 'yaml-patched-key-line' : ''}>
+        <span className="yaml-indent">{indent}</span>
+        <span className={`yaml-key ${isSpecialPatchedKey ? 'yaml-key-accent' : ''}`}>{key}</span>
+        <span className="yaml-colon">{colon}</span>
+        <span className={valClass}>{valuePart}</span>
+        {commentPart && <span className="yaml-comment">{commentPart}</span>}
+      </span>
+    )
+  }
+
+  const listMatch = line.match(/^(\s*-\s*)(.*)$/)
+  if (listMatch) {
+    const [, bullet, rest] = listMatch
+    return (
+      <span>
+        <span className="yaml-bullet">{bullet}</span>
+        <span className="yaml-val-str">{rest}</span>
+      </span>
+    )
+  }
+
+  return <span className="yaml-val-str">{line}</span>
+}
+
 function App() {
   const [form, setForm] = useState(DEFAULT_FORM)
   const [selectedEnvironments, setSelectedEnvironments] = useState(
@@ -51,6 +114,7 @@ function App() {
 
   const [autoScroll, setAutoScroll] = useState(true)
   const [copiedServiceYaml, setCopiedServiceYaml] = useState(false)
+  const [manifestExpanded, setManifestExpanded] = useState(false)
   const isUserInspectingRef = useRef(false)
   const controllerRef = useRef(null)
   const terminalBottomRef = useRef(null)
@@ -853,11 +917,11 @@ spec:
                         </span>
                         {svc.optimization?.optimal_values ? (
                           <span className="safe-tol-tag">
-                            SAFE: <code>RAM {svc.optimization.optimal_values.RAM} • LOSS {svc.optimization.optimal_values.LOSS}</code>
+                            SAFE: <code>RAM {String(svc.optimization.optimal_values.RAM).replace(/M(?!i)/g, 'Mi')} • LOSS {svc.optimization.optimal_values.LOSS}</code>
                           </span>
                         ) : svc.optimization?.max_safe_tolerance ? (
                           <span className="safe-tol-tag">
-                            SAFE: <code>{svc.optimization.max_safe_tolerance}</code>
+                            SAFE: <code>{String(svc.optimization.max_safe_tolerance).replace(/M(?!i)/g, 'Mi')}</code>
                           </span>
                         ) : null}
                       </div>
@@ -969,11 +1033,13 @@ spec:
                           </span>
                         </div>
                         <div className="param-card-value">
-                          {activeService.optimization.optimal_values?.RAM || activeService.optimization.max_safe_tolerance || 'N/A'}
+                          {activeService.optimization.optimal_values?.RAM 
+                            ? String(activeService.optimization.optimal_values.RAM).replace(/M(?!i)/g, 'Mi') 
+                            : (activeService.optimization.max_safe_tolerance ? String(activeService.optimization.max_safe_tolerance).replace(/M(?!i)/g, 'Mi') : 'N/A')}
                         </div>
                         <div className="param-card-bounds">
                           <span className="bounds-label">Active Bounds:</span>
-                          <code>[{activeService.optimization.bounds?.['Memory Stress']?.low || 1}M, {activeService.optimization.bounds?.['Memory Stress']?.high || 128}M]</code>
+                          <code>[{activeService.optimization.bounds?.['Memory Stress']?.low || 1}Mi, {activeService.optimization.bounds?.['Memory Stress']?.high || 128}Mi]</code>
                         </div>
                       </div>
 
@@ -1007,7 +1073,7 @@ spec:
                         </div>
                         <div className="param-card-bounds">
                           <span className="bounds-label">Active Bounds:</span>
-                          <code>[{activeService.optimization.bounds?.['Network Delay']?.low || 10}ms, {activeService.optimization.bounds?.['Network Delay']?.high || 1500}ms]</code>
+                          <code>[{activeService.optimization.bounds?.['Network Delay']?.low || 10}ms, {activeService.optimization.bounds?.['Network Delay']?.high || 400}ms]</code>
                         </div>
                       </div>
 
@@ -1020,11 +1086,11 @@ spec:
                           </span>
                         </div>
                         <div className="param-card-value">
-                          {activeService.optimization.optimal_values?.LOSS || '3.0%'}
+                          {activeService.optimization.optimal_values?.LOSS || '0.5%'}
                         </div>
                         <div className="param-card-bounds">
                           <span className="bounds-label">Active Bounds:</span>
-                          <code>[{activeService.optimization.bounds?.['Network Loss']?.low || 0.5}%, {activeService.optimization.bounds?.['Network Loss']?.high || 15.0}%]</code>
+                          <code>[{activeService.optimization.bounds?.['Network Loss']?.low != null ? activeService.optimization.bounds['Network Loss'].low : 0.0}%, {activeService.optimization.bounds?.['Network Loss']?.high || 1.0}%]</code>
                         </div>
                       </div>
                     </div>
@@ -1072,7 +1138,7 @@ spec:
                         <span className="box-title">Max Memory Observed</span>
                         <strong className="box-value">
                           {activeService.metrics?.memory_max
-                            ? `${Math.round(activeService.metrics.memory_max / (1024 * 1024))} MiB`
+                            ? `${Math.round(activeService.metrics.memory_max / (1024 * 1024))} Mi`
                             : 'N/A'}
                         </strong>
                         <small>During compound chaos</small>
@@ -1087,39 +1153,91 @@ spec:
                         <small>During compound chaos</small>
                       </div>
 
-                      {/* Optimized Kubernetes Deployment Manifest Panel */}
-                      <div className="manifest-export-card">
-                        <div className="manifest-export-header">
-                          <div className="manifest-title-group">
-                            <span className="indicator-pip" />
-                            <span className="manifest-title">RIGHT-SIZED KUBERNETES MANIFEST</span>
-                            <span className="manifest-badge">[PRODUCTION READY]</span>
-                          </div>
-                          <div className="manifest-actions">
-                            <button
-                              type="button"
-                              className="btn-manifest-action"
-                              onClick={() => handleCopyYaml(activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService))}
-                            >
-                              {copiedServiceYaml ? '[COPIED]' : '[COPY YAML]'}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn-manifest-action btn-manifest-download"
-                              onClick={() => handleDownloadYaml(activeService.name, activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService))}
-                            >
-                              [DOWNLOAD YAML]
-                            </button>
-                          </div>
-                        </div>
-                        <div className="manifest-code-wrapper">
-                          <pre className="manifest-code-block">
-                            <code>{activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService)}</code>
-                          </pre>
-                        </div>
                       </div>
+
+                      {/* Optimized Kubernetes Deployment Manifest Panel (Full Width Modern IDE Editor) */}
+                      {(() => {
+                        const rawYaml = activeService.optimization?.optimized_yaml || generateFallbackYaml(activeService)
+                        const yamlLines = (rawYaml || '').split(/\r?\n/)
+                        return (
+                          <div className={`manifest-ide-card ${manifestExpanded ? 'is-expanded' : ''}`}>
+                            <div className="manifest-ide-titlebar">
+                              <div className="ide-window-dots">
+                                <span className="ide-dot dot-close" />
+                                <span className="ide-dot dot-min" />
+                                <span className="ide-dot dot-max" />
+                              </div>
+                              <div className="ide-file-tab">
+                                <span className="ide-file-badge">YAML</span>
+                                <span className="ide-filename">{activeService.name}-optimized-deployment.yaml</span>
+                              </div>
+                              <div className="ide-header-badges">
+                                <span className="manifest-badge">[PRODUCTION READY]</span>
+                              </div>
+                              <div className="manifest-actions">
+                                <button
+                                  type="button"
+                                  className="btn-manifest-action"
+                                  onClick={() => setManifestExpanded(!manifestExpanded)}
+                                  title={manifestExpanded ? 'Collapse code view' : 'Expand full code view'}
+                                >
+                                  {manifestExpanded ? '[COLLAPSE]' : '[EXPAND]'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-manifest-action"
+                                  onClick={() => handleCopyYaml(rawYaml)}
+                                >
+                                  {copiedServiceYaml ? '[COPIED]' : '[COPY YAML]'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-manifest-action btn-manifest-download"
+                                  onClick={() => handleDownloadYaml(activeService.name, rawYaml)}
+                                >
+                                  [DOWNLOAD YAML]
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Quick Sizing Ribbon above code */}
+                            <div className="ide-telemetry-ribbon">
+                              <span className="ribbon-item">
+                                <span className="ribbon-label">REPLICAS:</span>
+                                <strong>2</strong>
+                              </span>
+                              <span className="ribbon-divider">•</span>
+                              <span className="ribbon-item">
+                                <span className="ribbon-label">REQ:</span>
+                                <strong>{activeService.optimization.recommended_config?.memory_request || '18Mi'} RAM / {activeService.optimization.recommended_config?.cpu_request || '25m'} CPU</strong>
+                              </span>
+                              <span className="ribbon-divider">•</span>
+                              <span className="ribbon-item">
+                                <span className="ribbon-label">LIMIT:</span>
+                                <strong>{activeService.optimization.recommended_config?.memory_limit || '32Mi'} RAM / {activeService.optimization.recommended_config?.cpu_limit || '62m'} CPU</strong>
+                              </span>
+                              <span className="ribbon-divider">•</span>
+                              <span className="ribbon-item">
+                                <span className="ribbon-label">PROBE TIMEOUT:</span>
+                                <strong>{activeService.optimization.optimal_values?.DELAY ? `${Math.max(1, Math.ceil(parseInt(String(activeService.optimization.optimal_values.DELAY).replace(/\D/g, '') || 1000) * 1.25 / 1000))}s` : '2s'}</strong>
+                              </span>
+                            </div>
+
+                            {/* Code Gutter & Editor Body */}
+                            <div className="manifest-ide-editor-body">
+                              <div className="yaml-code-scrollable">
+                                {yamlLines.map((line, idx) => (
+                                  <div className="yaml-editor-line" key={idx}>
+                                    <span className="yaml-line-num">{String(idx + 1).padStart(2, '0')}</span>
+                                    <span className="yaml-line-content">{highlightYamlLine(line)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      })()}
                     </div>
-                  </div>
                 ) : activeService.error ? (
                   <div className="error-banner">
                     <strong>Failure Details:</strong>
@@ -1171,7 +1289,7 @@ spec:
                               </div>
                               <div className="trial-meta-right">
                                 <span className={`delta-tag ${diffVal !== null && diffVal <= 16 ? 'delta-converged' : ''}`}>
-                                  DELTA: {diffVal !== null ? `${diffVal}M` : 'N/A'} {diffVal !== null && diffVal <= 16 ? '(CONVERGED)' : ''}
+                                  DELTA: {diffVal !== null ? `${diffVal}Mi` : 'N/A'} {diffVal !== null && diffVal <= 16 ? '(CONVERGED)' : ''}
                                 </span>
                               </div>
                             </div>
@@ -1182,7 +1300,13 @@ spec:
                               <div className="vector-chips-group">
                                 <span className={`vector-chip ${culprit === 'RAM' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">RAM</span>
-                                  <code className="chip-val">{vector.memory || (iter.vector?.RAM ? `${iter.vector.RAM}M` : iter.tested_value || iter.display)}</code>
+                                  <code className="chip-val">
+                                    {vector.memory 
+                                      ? String(vector.memory).replace(/M(?!i)/g, 'Mi') 
+                                      : (iter.vector?.RAM 
+                                          ? `${String(iter.vector.RAM).replace(/M(?!i)/g, '')}Mi` 
+                                          : String(iter.tested_value || iter.display || '').replace(/M(?!i)/g, 'Mi'))}
+                                  </code>
                                 </span>
                                 <span className={`vector-chip ${culprit === 'CPU' ? 'chip-culprit' : isPass ? 'chip-pass' : ''}`}>
                                   <span className="chip-key">CPU</span>
@@ -1231,7 +1355,7 @@ spec:
                               <div className="trial-param-bounds-row">
                                 <span className="bounds-row-label">BOUNDS:</span>
                                 <span className={`param-bound-chip ${culprit === 'RAM' ? 'is-culprit' : ''}`}>
-                                  RAM: <code>[{paramStates.RAM.low}M, {paramStates.RAM.high}M]</code>
+                                  RAM: <code>[{paramStates.RAM.low}Mi, {paramStates.RAM.high}Mi]</code>
                                 </span>
                                 <span className={`param-bound-chip ${culprit === 'CPU' ? 'is-culprit' : ''}`}>
                                   CPU: <code>[{paramStates.CPU.low}%, {paramStates.CPU.high}%]</code>
@@ -1253,9 +1377,9 @@ spec:
                               </div>
                               <div className="midpoint-next-tag">
                                 {iter.next_midpoint && !iter.converged ? (
-                                  <span>NEXT MIDPOINT: <code>{iter.next_midpoint}</code></span>
+                                  <span>NEXT MIDPOINT: <code>{String(iter.next_midpoint).replace(/M(?!i)/g, 'Mi')}</code></span>
                                 ) : (
-                                  <span className="converged-final-tag">CONVERGED AT {activeService.optimization?.max_safe_tolerance || iter.tested_value}</span>
+                                  <span className="converged-final-tag">CONVERGED AT {String(activeService.optimization?.max_safe_tolerance || iter.tested_value).replace(/M(?!i)/g, 'Mi')}</span>
                                 )}
                               </div>
                             </div>
